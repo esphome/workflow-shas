@@ -1,29 +1,17 @@
-#!/usr/bin/env python3
-"""Check all esphome organization repos for SHA pinning in GitHub Actions.
+"""Check SHA pinning compliance and manage tracking issues.
 
-Creates/updates a pinned tracking issue in esphome/workflow-shas with
-sub-issues in each non-compliant repository.
-
-Usage:
-    python check_sha_pinning.py              # full run: scan + update issues
-    python check_sha_pinning.py --dry-run    # scan only, don't create/update issues
+Scans all repos in an org, creates/updates a pinned tracking issue in
+a designated tracking repo, and creates sub-issues in each non-compliant
+repository.
 """
 
 from __future__ import annotations
 
-import argparse
-import base64
 import json
-import re
-import subprocess
 from pathlib import Path
 
-ORG = "esphome"
-TRACKING_REPO = "workflow-shas"
-TRACKING_REPO_FULL = f"{ORG}/{TRACKING_REPO}"
-
-SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-USES_PATTERN = re.compile(r"uses:\s*([^@\s]+)@(\S+)")
+from ..gh import gh_api_json, run_gh
+from ..scan import check_repo, get_repos
 
 # Title used to find/create the parent tracking issue
 TRACKING_ISSUE_TITLE = "GitHub Actions SHA Pinning Compliance"
@@ -67,157 +55,7 @@ security-hardening-for-github-actions#using-third-party-actions)
 
 
 # ---------------------------------------------------------------------------
-# GitHub API helpers
-# ---------------------------------------------------------------------------
-
-
-def run_gh(*args: str) -> str:
-    """Run a gh CLI command and return stdout."""
-    result = subprocess.run(
-        ["gh", *args],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args)} failed: {result.stderr}")
-    return result.stdout
-
-
-def gh_api_json(endpoint: str, **kwargs) -> dict | list:
-    """Call the GitHub REST API and return parsed JSON."""
-    args = ["api", endpoint]
-    for k, v in kwargs.items():
-        args.extend([f"--{k}", v])
-    return json.loads(run_gh(*args))
-
-
-# ---------------------------------------------------------------------------
-# Repo scanning (unchanged from original)
-# ---------------------------------------------------------------------------
-
-
-def get_repos() -> list[dict]:
-    """Get all non-archived repos in the organization."""
-    data = json.loads(
-        run_gh("repo", "list", ORG, "--limit", "200", "--json", "name,isArchived")
-    )
-    return [r for r in data if not r["isArchived"]]
-
-
-def get_sha_pinning_required(repo_name: str) -> bool | None:
-    """Check if the repo has sha_pinning_required enabled."""
-    full_name = f"{ORG}/{repo_name}"
-    try:
-        output = run_gh(
-            "api",
-            f"repos/{full_name}/actions/permissions",
-            "--jq",
-            ".sha_pinning_required",
-        )
-        value = output.strip().lower()
-        if value == "true":
-            return True
-        elif value == "false":
-            return False
-        return None
-    except RuntimeError:
-        return None
-
-
-def get_workflow_files(repo_name: str) -> list[str]:
-    """Get list of workflow file paths for a repo."""
-    full_name = f"{ORG}/{repo_name}"
-    try:
-        output = run_gh(
-            "api",
-            f"repos/{full_name}/contents/.github/workflows",
-            "--jq",
-            ".[].name",
-        )
-        files = [f.strip() for f in output.strip().split("\n") if f.strip()]
-        return [f for f in files if f.endswith((".yml", ".yaml"))]
-    except RuntimeError:
-        return []
-
-
-def get_file_content(repo_name: str, path: str) -> str:
-    """Get raw file content from a repo (base64-decoded)."""
-    full_name = f"{ORG}/{repo_name}"
-    try:
-        raw = run_gh("api", f"repos/{full_name}/contents/{path}", "--jq", ".content")
-        return base64.b64decode(raw.replace("\n", "")).decode("utf-8")
-    except (RuntimeError, Exception):
-        return ""
-
-
-def analyze_workflow(content: str) -> dict:
-    """Analyze a workflow file for action references."""
-    sha_pinned = []
-    not_pinned = []
-
-    for match in USES_PATTERN.finditer(content):
-        action = match.group(1)
-        ref = match.group(2)
-
-        # Strip inline comments from ref (e.g., "abc123 # v4.2" -> "abc123")
-        if " " in ref:
-            ref = ref.split()[0]
-
-        if action.startswith("./") or action.startswith("docker://"):
-            continue
-
-        if SHA_PATTERN.match(ref):
-            sha_pinned.append(f"{action}@{ref}")
-        else:
-            not_pinned.append(f"{action}@{ref}")
-
-    return {"sha_pinned": sha_pinned, "not_pinned": not_pinned}
-
-
-def check_repo(repo_name: str) -> dict:
-    """Check a single repo for SHA pinning status."""
-    sha_pinning_required = get_sha_pinning_required(repo_name)
-    workflow_files = get_workflow_files(repo_name)
-
-    if not workflow_files:
-        return {
-            "name": repo_name,
-            "has_workflows": False,
-            "all_pinned": None,
-            "sha_pinning_required": sha_pinning_required,
-            "sha_pinned": [],
-            "not_pinned": [],
-            "workflow_files": [],
-        }
-
-    all_sha_pinned = []
-    all_not_pinned = []
-
-    for wf in workflow_files:
-        path = f".github/workflows/{wf}"
-        content = get_file_content(repo_name, path)
-        if not content:
-            continue
-        result = analyze_workflow(content)
-        all_sha_pinned.extend(result["sha_pinned"])
-        all_not_pinned.extend(result["not_pinned"])
-
-    has_actions = len(all_sha_pinned) + len(all_not_pinned) > 0
-    all_pinned = has_actions and len(all_not_pinned) == 0
-
-    return {
-        "name": repo_name,
-        "has_workflows": True,
-        "all_pinned": all_pinned if has_actions else None,
-        "sha_pinning_required": sha_pinning_required,
-        "sha_pinned": sorted(set(all_sha_pinned)),
-        "not_pinned": sorted(set(all_not_pinned)),
-        "workflow_files": workflow_files,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Issue management
+# Issue management helpers
 # ---------------------------------------------------------------------------
 
 
@@ -232,7 +70,7 @@ def get_issue_numeric_id(repo_full: str, issue_number: int) -> int:
     return data["id"]
 
 
-def find_tracking_issue() -> dict | None:
+def find_tracking_issue(tracking_repo: str) -> dict | None:
     """Find the existing tracking issue in the tracking repo."""
     try:
         issues = json.loads(
@@ -240,7 +78,7 @@ def find_tracking_issue() -> dict | None:
                 "issue",
                 "list",
                 "--repo",
-                TRACKING_REPO_FULL,
+                tracking_repo,
                 "--state",
                 "open",
                 "--search",
@@ -259,24 +97,22 @@ def find_tracking_issue() -> dict | None:
     return None
 
 
-def create_tracking_issue(body: str) -> dict:
+def create_tracking_issue(tracking_repo: str, body: str) -> dict:
     """Create the tracking issue and pin it."""
     url = run_gh(
         "issue",
         "create",
         "--repo",
-        TRACKING_REPO_FULL,
+        tracking_repo,
         "--title",
         TRACKING_ISSUE_TITLE,
         "--body",
         body,
     ).strip()
-    # Extract issue number from URL
     number = int(url.rstrip("/").split("/")[-1])
 
-    # Pin the issue
     try:
-        run_gh("issue", "pin", str(number), "--repo", TRACKING_REPO_FULL)
+        run_gh("issue", "pin", str(number), "--repo", tracking_repo)
         print(f"  Pinned tracking issue #{number}")
     except RuntimeError as e:
         print(f"  Warning: could not pin issue: {e}")
@@ -285,27 +121,27 @@ def create_tracking_issue(body: str) -> dict:
     return {"number": number, "title": TRACKING_ISSUE_TITLE}
 
 
-def update_tracking_issue(issue_number: int, body: str) -> None:
+def update_tracking_issue(tracking_repo: str, issue_number: int, body: str) -> None:
     """Update the body of the tracking issue."""
     run_gh(
         "issue",
         "edit",
         str(issue_number),
         "--repo",
-        TRACKING_REPO_FULL,
+        tracking_repo,
         "--body",
         body,
     )
     print(f"  Updated tracking issue #{issue_number}")
 
 
-def get_existing_sub_issues(issue_number: int) -> list[dict]:
+def get_existing_sub_issues(tracking_repo: str, issue_number: int) -> list[dict]:
     """Get all current sub-issues of the tracking issue."""
     try:
         return json.loads(
             run_gh(
                 "api",
-                f"repos/{TRACKING_REPO_FULL}/issues/{issue_number}/sub_issues",
+                f"repos/{tracking_repo}/issues/{issue_number}/sub_issues",
                 "--paginate",
             )
         )
@@ -313,9 +149,9 @@ def get_existing_sub_issues(issue_number: int) -> list[dict]:
         return []
 
 
-def find_repo_issue(repo_name: str) -> dict | None:
+def find_repo_issue(org: str, repo_name: str) -> dict | None:
     """Find an existing SHA pinning issue in a specific repo."""
-    full_name = f"{ORG}/{repo_name}"
+    full_name = f"{org}/{repo_name}"
     try:
         issues = json.loads(
             run_gh(
@@ -341,9 +177,9 @@ def find_repo_issue(repo_name: str) -> dict | None:
     return None
 
 
-def create_sub_issue(repo_name: str, not_pinned: list[str]) -> dict | None:
+def create_sub_issue(org: str, repo_name: str, not_pinned: list[str]) -> dict | None:
     """Create a sub-issue in the target repo."""
-    full_name = f"{ORG}/{repo_name}"
+    full_name = f"{org}/{repo_name}"
     unpinned_list = "\n".join(f"- `{action}`" for action in sorted(not_pinned))
     body = SUB_ISSUE_BODY_TEMPLATE.format(unpinned_list=unpinned_list)
 
@@ -370,9 +206,11 @@ def create_sub_issue(repo_name: str, not_pinned: list[str]) -> dict | None:
         return None
 
 
-def update_sub_issue(repo_name: str, issue_number: int, not_pinned: list[str]) -> None:
+def update_sub_issue(
+    org: str, repo_name: str, issue_number: int, not_pinned: list[str]
+) -> None:
     """Update the body of an existing sub-issue."""
-    full_name = f"{ORG}/{repo_name}"
+    full_name = f"{org}/{repo_name}"
     unpinned_list = "\n".join(f"- `{action}`" for action in sorted(not_pinned))
     body = SUB_ISSUE_BODY_TEMPLATE.format(unpinned_list=unpinned_list)
 
@@ -391,9 +229,9 @@ def update_sub_issue(repo_name: str, issue_number: int, not_pinned: list[str]) -
         print(f"    ERROR updating issue in {full_name}: {e}")
 
 
-def close_sub_issue(repo_name: str, issue_number: int) -> None:
+def close_sub_issue(org: str, repo_name: str, issue_number: int) -> None:
     """Close a sub-issue (repo is now compliant)."""
-    full_name = f"{ORG}/{repo_name}"
+    full_name = f"{org}/{repo_name}"
     try:
         run_gh(
             "issue",
@@ -409,22 +247,23 @@ def close_sub_issue(repo_name: str, issue_number: int) -> None:
         print(f"    ERROR closing issue in {full_name}: {e}")
 
 
-def link_sub_issue(tracking_issue_number: int, sub_issue_id: int) -> None:
+def link_sub_issue(
+    tracking_repo: str, tracking_issue_number: int, sub_issue_id: int
+) -> None:
     """Add a sub-issue to the tracking issue."""
     try:
         run_gh(
             "api",
             "--method",
             "POST",
-            f"repos/{TRACKING_REPO_FULL}/issues/{tracking_issue_number}/sub_issues",
-            "-f",
+            f"repos/{tracking_repo}/issues/{tracking_issue_number}/sub_issues",
+            "-F",
             f"sub_issue_id={sub_issue_id}",
         )
     except RuntimeError as e:
-        # May already be linked, or cross-repo sub-issues may not be supported
         err = str(e)
         if "already" in err.lower() or "Sub-issue already exists" in err:
-            pass  # Already linked
+            pass
         else:
             print(f"    Warning: could not link sub-issue: {e}")
 
@@ -450,7 +289,7 @@ def format_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     return [fmt_row(headers), separator] + [fmt_row(row) for row in rows]
 
 
-def generate_tracking_body(results: list[dict]) -> str:
+def generate_tracking_body(org: str, results: list[dict]) -> str:
     """Generate the markdown body for the tracking issue."""
     pinned = [r for r in results if r["all_pinned"] is True]
     not_pinned = [r for r in results if r["all_pinned"] is False]
@@ -469,7 +308,7 @@ def generate_tracking_body(results: list[dict]) -> str:
 
     lines = [
         "This issue tracks SHA pinning compliance for GitHub Actions across "
-        "all repositories in the [esphome](https://github.com/esphome) organization.",
+        f"all repositories in the [{org}](https://github.com/{org}) organization.",
         "",
         "**SHA pinning** means referencing actions by their full commit SHA "
         "(e.g., `actions/checkout@<sha>`) instead of a mutable tag "
@@ -491,13 +330,12 @@ def generate_tracking_body(results: list[dict]) -> str:
         "",
     ]
 
-    # Compliant repos
     if pinned:
         lines.append("### Fully SHA-Pinned Repositories")
         lines.append("")
         table_rows = []
         for r in sorted(pinned, key=lambda x: x["name"]):
-            repo_link = f"[{r['name']}](https://github.com/{ORG}/{r['name']})"
+            repo_link = f"[{r['name']}](https://github.com/{org}/{r['name']})"
             wf_list = ", ".join(f"`{wf}`" for wf in sorted(r["workflow_files"]))
             table_rows.append([repo_link, enforcement_label(r), wf_list])
         lines.extend(
@@ -505,13 +343,12 @@ def generate_tracking_body(results: list[dict]) -> str:
         )
         lines.append("")
 
-    # Non-compliant repos
     if not_pinned:
         lines.append("### Repositories NOT Fully SHA-Pinned")
         lines.append("")
         table_rows = []
         for r in sorted(not_pinned, key=lambda x: x["name"]):
-            repo_link = f"[{r['name']}](https://github.com/{ORG}/{r['name']})"
+            repo_link = f"[{r['name']}](https://github.com/{org}/{r['name']})"
             unpinned = str(len(r["not_pinned"]))
             pinned_count = str(len(r["sha_pinned"]))
             table_rows.append([repo_link, enforcement_label(r), unpinned, pinned_count])
@@ -520,20 +357,18 @@ def generate_tracking_body(results: list[dict]) -> str:
         )
         lines.append("")
 
-    # No external actions
     if no_actions:
         lines.append("### Workflows Without External Actions")
         lines.append("")
         for r in sorted(no_actions, key=lambda x: x["name"]):
-            lines.append(f"- [{r['name']}](https://github.com/{ORG}/{r['name']})")
+            lines.append(f"- [{r['name']}](https://github.com/{org}/{r['name']})")
         lines.append("")
 
-    # No workflows
     if no_workflows:
         lines.append("### Repositories Without Workflows")
         lines.append("")
         for r in sorted(no_workflows, key=lambda x: x["name"]):
-            lines.append(f"- [{r['name']}](https://github.com/{ORG}/{r['name']})")
+            lines.append(f"- [{r['name']}](https://github.com/{org}/{r['name']})")
         lines.append("")
 
     lines.append("---")
@@ -543,35 +378,34 @@ def generate_tracking_body(results: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Subcommand entry point
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Check SHA pinning compliance and manage tracking issues.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Scan repos and print results, but don't create/update issues.",
-    )
-    return parser.parse_args()
+def run(
+    org: str,
+    tracking_repo: str,
+    *,
+    repos: list[str] | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Run the check command."""
+    tracking_repo_full = f"{org}/{tracking_repo}"
 
-
-def main():
-    args = parse_args()
-
-    # --- Phase 1: Scan all repos ---
-    print("Fetching repository list...")
-    repos = get_repos()
-    print(f"Found {len(repos)} active repositories in {ORG}\n")
+    # --- Phase 1: Scan repos ---
+    if repos:
+        repo_names = sorted(repos)
+        print(f"Checking {len(repo_names)} specified repos...\n")
+    else:
+        print("Fetching repository list...")
+        all_repos = get_repos(org)
+        repo_names = sorted(r["name"] for r in all_repos)
+        print(f"Found {len(repo_names)} active repositories in {org}\n")
 
     results = []
-    for i, repo in enumerate(sorted(repos, key=lambda x: x["name"]), 1):
-        name = repo["name"]
-        print(f"  [{i}/{len(repos)}] Checking {name}...", end=" ", flush=True)
-        result = check_repo(name)
+    for i, name in enumerate(repo_names, 1):
+        print(f"  [{i}/{len(repo_names)}] Checking {name}...", end=" ", flush=True)
+        result = check_repo(org, name)
         results.append(result)
 
         enforced = " [enforced]" if result["sha_pinning_required"] else ""
@@ -585,7 +419,7 @@ def main():
             print(f"NOT pinned ({len(result['not_pinned'])} unpinned){enforced}")
 
     # Save raw results
-    json_path = Path(__file__).parent / "results.json"
+    json_path = Path(__file__).resolve().parent.parent.parent / "results.json"
     json_path.write_text(json.dumps(results, indent=2) + "\n")
     print(f"\nResults saved to {json_path}")
 
@@ -594,34 +428,34 @@ def main():
 
     print(f"\n{len(not_pinned_repos)} non-compliant repos found")
 
-    if args.dry_run:
+    if dry_run:
         print("\n[dry-run] Would create/update tracking issue with body:")
         print("---")
-        print(generate_tracking_body(results))
+        print(generate_tracking_body(org, results))
         print("---")
         for r in not_pinned_repos:
-            print(f"[dry-run] Would create/update sub-issue in {ORG}/{r['name']}")
+            print(f"[dry-run] Would create/update sub-issue in {org}/{r['name']}")
         return
 
     # --- Phase 2: Manage tracking issue ---
     print("\nManaging tracking issue...")
-    tracking_body = generate_tracking_body(results)
+    tracking_body = generate_tracking_body(org, results)
 
-    tracking_issue = find_tracking_issue()
+    tracking_issue = find_tracking_issue(tracking_repo_full)
     if tracking_issue:
-        update_tracking_issue(tracking_issue["number"], tracking_body)
+        update_tracking_issue(
+            tracking_repo_full, tracking_issue["number"], tracking_body
+        )
     else:
-        tracking_issue = create_tracking_issue(tracking_body)
+        tracking_issue = create_tracking_issue(tracking_repo_full, tracking_body)
 
     tracking_number = tracking_issue["number"]
 
     # Get existing sub-issues to know what's already linked
-    existing_subs = get_existing_sub_issues(tracking_number)
-    # Map: repo full_name -> sub-issue data
-    existing_sub_repos = {}
+    existing_subs = get_existing_sub_issues(tracking_repo_full, tracking_number)
+    existing_sub_repos: dict[str, dict] = {}
     for sub in existing_subs:
         repo_url = sub.get("repository_url", "")
-        # repository_url is like "https://api.github.com/repos/esphome/firmware"
         repo_full = "/".join(repo_url.rstrip("/").split("/")[-2:])
         existing_sub_repos[repo_full] = sub
 
@@ -629,24 +463,22 @@ def main():
     print("\nManaging sub-issues...")
     for r in sorted(not_pinned_repos, key=lambda x: x["name"]):
         repo_name = r["name"]
-        repo_full = f"{ORG}/{repo_name}"
+        repo_full = f"{org}/{repo_name}"
         print(f"  {repo_name}:")
 
-        # Find or create the sub-issue in the target repo
-        existing = find_repo_issue(repo_name)
+        existing = find_repo_issue(org, repo_name)
         if existing:
-            update_sub_issue(repo_name, existing["number"], r["not_pinned"])
+            update_sub_issue(org, repo_name, existing["number"], r["not_pinned"])
             sub_issue_number = existing["number"]
         else:
-            created = create_sub_issue(repo_name, r["not_pinned"])
+            created = create_sub_issue(org, repo_name, r["not_pinned"])
             if not created:
                 continue
             sub_issue_number = created["number"]
 
-        # Link as sub-issue if not already linked
         if repo_full not in existing_sub_repos:
             numeric_id = get_issue_numeric_id(repo_full, sub_issue_number)
-            link_sub_issue(tracking_number, numeric_id)
+            link_sub_issue(tracking_repo_full, tracking_number, numeric_id)
             print(f"    Linked as sub-issue of #{tracking_number}")
 
     # --- Phase 4: Close sub-issues for repos that are now compliant ---
@@ -654,13 +486,8 @@ def main():
     for repo_full, sub in existing_sub_repos.items():
         repo_name = repo_full.split("/")[-1]
         if repo_name in compliant_repos and sub.get("state") == "open":
-            # Find the issue in the target repo to close it
-            close_sub_issue(repo_name, sub["number"])
+            close_sub_issue(org, repo_name, sub["number"])
 
     print(
-        f"\nDone. Tracking issue: https://github.com/{TRACKING_REPO_FULL}/issues/{tracking_number}"
+        f"\nDone. Tracking issue: https://github.com/{tracking_repo_full}/issues/{tracking_number}"
     )
-
-
-if __name__ == "__main__":
-    main()

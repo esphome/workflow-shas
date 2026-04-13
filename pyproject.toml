@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workflow-shas"
+version = "0.1.0"
+description = "Track and enforce GitHub Actions SHA pinning across a GitHub organization."
+requires-python = ">=3.11"
+
+[project.scripts]
+workflow-shas = "workflow_shas.cli:main"

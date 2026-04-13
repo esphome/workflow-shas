@@ -1,17 +1,82 @@
 # workflow-shas
 
-Tracks GitHub Actions SHA pinning compliance across the [esphome](https://github.com/esphome) organization.
+Track and enforce GitHub Actions SHA pinning compliance across a GitHub organization.
 
-## How it works
+## Using as a GitHub Action
 
-A [daily workflow](.github/workflows/check.yml) scans all active repositories in the esphome organization and checks whether their GitHub Actions workflow files reference actions and reusable workflows by immutable commit SHA or by mutable tag/branch.
+Other orgs can use this directly — no fork needed:
 
-Results are published as a pinned [tracking issue](../../issues) in this repository, with a sub-issue opened in each non-compliant repo. When a repo becomes fully compliant, its sub-issue is automatically closed.
+```yaml
+name: Check SHA Pinning Compliance
 
-## Scripts
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
-- **`check_sha_pinning.py`** — Scans all org repos and manages the tracking issue + sub-issues.
-- **`pin_shas.py`** — Batch tool to clone repos, pin action refs to SHAs, and open PRs.
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check SHA pinning compliance
+        uses: esphome/workflow-shas@main
+        env:
+          GH_TOKEN: ${{ secrets.YOUR_TOKEN }}
+        with:
+          command: check
+          org: your-org
+          tracking-repo: your-tracking-repo
+```
+
+### Inputs
+
+| Input | Required | Description |
+|-------|----------|-------------|
+| `command` | Yes | Subcommand: `check`, `pin`, or `enforce` |
+| `org` | Yes | GitHub organization to operate on |
+| `tracking-repo` | For `check` | Repo name for the tracking issue |
+| `repos` | No | Comma-separated list of specific repos to process |
+| `dry-run` | No | Set to `"true"` to run without mutations |
+
+### Commands
+
+**`check`** — Scan all repos, update the tracking issue, create/close sub-issues:
+
+```yaml
+- uses: esphome/workflow-shas@main
+  with:
+    command: check
+    org: your-org
+    tracking-repo: workflow-shas
+```
+
+**`enforce`** — Enable `sha_pinning_required` on repos where it's safe:
+
+```yaml
+- uses: esphome/workflow-shas@main
+  with:
+    command: enforce
+    org: your-org
+```
+
+**`pin`** — (CLI only) Clone repos, resolve action refs to SHAs, open PRs. Best run locally since it needs a workspace for cloning.
+
+### Token permissions
+
+The `GH_TOKEN` environment variable must be set to a token with:
+- `issues: write` on all org repos (for creating/closing sub-issues)
+- `actions: write` on all org repos (for `enforce` command)
+- `contents: read` on all org repos (for scanning workflows)
+
+A [GitHub App](https://docs.github.com/en/apps/creating-github-apps) installed on the org is recommended.
+
+## Local CLI usage
+
+```bash
+uv run workflow-shas --org your-org check --tracking-repo workflow-shas
+uv run workflow-shas --org your-org enforce --dry-run
+uv run workflow-shas --org your-org pin --repo some-repo --dry-run
+```
 
 ## Why SHA pinning?
 
