@@ -336,7 +336,10 @@ def generate_tracking_body(org: str, results: list[dict]) -> str:
         table_rows = []
         for r in sorted(pinned, key=lambda x: x["name"]):
             repo_link = f"[{r['name']}](https://github.com/{org}/{r['name']})"
-            wf_list = ", ".join(f"`{wf}`" for wf in sorted(r["workflow_files"]))
+            wf_list = ", ".join(
+                [f"`{wf}`" for wf in sorted(r["workflow_files"])]
+                + [f"`{af}`" for af in sorted(r.get("action_files", []))]
+            )
             table_rows.append([repo_link, enforcement_label(r), wf_list])
         lines.extend(
             format_table(["Repository", "Enforced", "Workflow Files"], table_rows)

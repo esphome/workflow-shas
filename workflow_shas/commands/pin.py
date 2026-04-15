@@ -279,66 +279,90 @@ def resolve_full_version_tag(repo_slug: str, sha: str, original_ref: str) -> str
     return candidates[0]
 
 
+def _pin_file(
+    wf_file: Path,
+    cache: dict[tuple[str, str], tuple[str, str] | None],
+) -> bool:
+    """Pin action refs in a single file. Returns True if the file was modified."""
+    content = wf_file.read_text()
+    new_content = content
+
+    for match in USES_PATTERN.finditer(content):
+        prefix = match.group(1)
+        action = match.group(2)
+        ref = match.group(3)
+
+        if " " in ref:
+            ref = ref.split()[0]
+
+        if action.startswith("./") or action.startswith("docker://"):
+            continue
+
+        if SHA_PATTERN.match(ref):
+            continue
+
+        repo_slug = _repo_slug(action)
+        cache_key = (repo_slug, ref)
+
+        if cache_key not in cache:
+            sha = resolve_ref_to_sha(repo_slug, ref)
+            if sha is None:
+                print(f"    WARNING: could not resolve {action}@{ref}")
+                cache[cache_key] = None
+            else:
+                version_tag = resolve_full_version_tag(repo_slug, sha, ref)
+                cache[cache_key] = (sha, version_tag)
+
+        resolved = cache[cache_key]
+        if resolved is None:
+            continue
+
+        sha, version_tag = resolved
+        old_text = f"{prefix}{action}@{match.group(3)}"
+        new_text = f"{prefix}{action}@{sha}  # {version_tag}"
+        new_content = new_content.replace(old_text, new_text, 1)
+
+        if version_tag != ref:
+            print(
+                f"    {wf_file.name}: {action}@{ref} -> @{sha[:12]}... # {version_tag}"
+            )
+        else:
+            print(f"    {wf_file.name}: {action}@{ref} -> @{sha[:12]}... # {ref}")
+
+    if new_content != content:
+        wf_file.write_text(new_content)
+        return True
+    return False
+
+
 def pin_actions(work_dir: Path) -> bool:
     """Rewrite all action and reusable workflow refs to SHA pins.
 
+    Processes .github/workflows/*.yml and any action.yml/action.yaml
+    files found anywhere in the repo.
+
     Returns True if any files were modified.
     """
-    workflows_dir = work_dir / ".github" / "workflows"
-    if not workflows_dir.is_dir():
-        print("    No .github/workflows directory found")
-        return False
-
     cache: dict[tuple[str, str], tuple[str, str] | None] = {}
 
-    for wf_file in sorted(workflows_dir.glob("*.y*ml")):
-        content = wf_file.read_text()
-        new_content = content
+    files_to_pin: list[Path] = []
 
-        for match in USES_PATTERN.finditer(content):
-            prefix = match.group(1)
-            action = match.group(2)
-            ref = match.group(3)
+    # Workflow files
+    workflows_dir = work_dir / ".github" / "workflows"
+    if workflows_dir.is_dir():
+        files_to_pin.extend(sorted(workflows_dir.glob("*.y*ml")))
 
-            if " " in ref:
-                ref = ref.split()[0]
+    # Action definition files anywhere in the repo
+    for action_file in sorted(work_dir.rglob("action.y*ml")):
+        if action_file.name in ("action.yml", "action.yaml"):
+            files_to_pin.append(action_file)
 
-            if action.startswith("./") or action.startswith("docker://"):
-                continue
+    if not files_to_pin:
+        print("    No workflow or action files found")
+        return False
 
-            if SHA_PATTERN.match(ref):
-                continue
-
-            repo_slug = _repo_slug(action)
-            cache_key = (repo_slug, ref)
-
-            if cache_key not in cache:
-                sha = resolve_ref_to_sha(repo_slug, ref)
-                if sha is None:
-                    print(f"    WARNING: could not resolve {action}@{ref}")
-                    cache[cache_key] = None
-                else:
-                    version_tag = resolve_full_version_tag(repo_slug, sha, ref)
-                    cache[cache_key] = (sha, version_tag)
-
-            resolved = cache[cache_key]
-            if resolved is None:
-                continue
-
-            sha, version_tag = resolved
-            old_text = f"{prefix}{action}@{match.group(3)}"
-            new_text = f"{prefix}{action}@{sha}  # {version_tag}"
-            new_content = new_content.replace(old_text, new_text, 1)
-
-            if version_tag != ref:
-                print(
-                    f"    {wf_file.name}: {action}@{ref} -> @{sha[:12]}... # {version_tag}"
-                )
-            else:
-                print(f"    {wf_file.name}: {action}@{ref} -> @{sha[:12]}... # {ref}")
-
-        if new_content != content:
-            wf_file.write_text(new_content)
+    for f in files_to_pin:
+        _pin_file(f, cache)
 
     # Check via git diff whether anything actually changed on disk
     result = run_cmd("git", "diff", "--quiet", cwd=work_dir, check=False)
@@ -354,6 +378,11 @@ def has_changes(work_dir: Path) -> bool:
 def commit_changes(work_dir: Path) -> None:
     """Stage and commit the pinning changes."""
     run_cmd("git", "add", ".github/workflows/", cwd=work_dir)
+    # Stage any action.yml/action.yaml files anywhere in the repo
+    for action_file in work_dir.rglob("action.y*ml"):
+        if action_file.name in ("action.yml", "action.yaml"):
+            rel = action_file.relative_to(work_dir)
+            run_cmd("git", "add", str(rel), cwd=work_dir)
 
     result = run_cmd("git", "diff", "--cached", "--quiet", cwd=work_dir, check=False)
     if result.returncode == 0:

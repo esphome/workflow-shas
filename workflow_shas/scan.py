@@ -54,6 +54,27 @@ def get_workflow_files(org: str, repo_name: str) -> list[str]:
         return []
 
 
+def get_action_files(org: str, repo_name: str) -> list[str]:
+    """Find all action.yml / action.yaml files anywhere in the repo."""
+    try:
+        output = run_gh(
+            "api",
+            f"repos/{org}/{repo_name}/git/trees/HEAD?recursive=1",
+            "-q",
+            '.tree[] | select(.type == "blob") | .path',
+            "--paginate",
+        )
+    except RuntimeError:
+        return []
+
+    return [
+        p.strip()
+        for p in output.strip().split("\n")
+        if p.strip().endswith(("/action.yml", "/action.yaml"))
+        or p.strip() in ("action.yml", "action.yaml")
+    ]
+
+
 def get_file_content(org: str, repo_name: str, path: str) -> str:
     """Get raw file content from a repo (base64-decoded)."""
     try:
@@ -96,12 +117,14 @@ def check_repo(org: str, repo_name: str) -> dict:
     """Check a single repo for SHA pinning status.
 
     Returns a dict with keys: ``name``, ``has_workflows``, ``all_pinned``,
-    ``sha_pinning_required``, ``sha_pinned``, ``not_pinned``, ``workflow_files``.
+    ``sha_pinning_required``, ``sha_pinned``, ``not_pinned``,
+    ``workflow_files``, ``action_files``.
     """
     sha_pinning_required = get_sha_pinning_required(org, repo_name)
     workflow_files = get_workflow_files(org, repo_name)
+    action_files = get_action_files(org, repo_name)
 
-    if not workflow_files:
+    if not workflow_files and not action_files:
         return {
             "name": repo_name,
             "has_workflows": False,
@@ -110,6 +133,7 @@ def check_repo(org: str, repo_name: str) -> dict:
             "sha_pinned": [],
             "not_pinned": [],
             "workflow_files": [],
+            "action_files": [],
         }
 
     all_sha_pinned: list[str] = []
@@ -118,6 +142,14 @@ def check_repo(org: str, repo_name: str) -> dict:
     for wf in workflow_files:
         path = f".github/workflows/{wf}"
         content = get_file_content(org, repo_name, path)
+        if not content:
+            continue
+        result = analyze_workflow(content)
+        all_sha_pinned.extend(result["sha_pinned"])
+        all_not_pinned.extend(result["not_pinned"])
+
+    for af in action_files:
+        content = get_file_content(org, repo_name, af)
         if not content:
             continue
         result = analyze_workflow(content)
@@ -135,4 +167,5 @@ def check_repo(org: str, repo_name: str) -> dict:
         "sha_pinned": sorted(set(all_sha_pinned)),
         "not_pinned": sorted(set(all_not_pinned)),
         "workflow_files": workflow_files,
+        "action_files": action_files,
     }
