@@ -6,10 +6,16 @@ import base64
 import json
 import re
 
+import yaml
+
 from .gh import run_gh
 
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 USES_PATTERN = re.compile(r"uses:\s*([^@\s]+)@(\S+)")
+
+WORKFLOWS_DIR = ".github/workflows"
+LOCKFILE_PATH = f"{WORKFLOWS_DIR}/actions.lock"
+VERIFY_WORKFLOW_NAME = "verify-lockfile.yml"
 
 
 def get_repos(org: str) -> list[dict]:
@@ -113,59 +119,89 @@ def analyze_workflow(content: str) -> dict:
     return {"sha_pinned": sha_pinned, "not_pinned": not_pinned}
 
 
-def check_repo(org: str, repo_name: str) -> dict:
-    """Check a single repo for SHA pinning status.
+def get_lockfile(org: str, repo_name: str) -> str:
+    """Get the raw ``actions.lock`` content for a repo ("" if absent)."""
+    return get_file_content(org, repo_name, LOCKFILE_PATH)
 
-    Returns a dict with keys: ``name``, ``has_workflows``, ``all_pinned``,
-    ``sha_pinning_required``, ``sha_pinned``, ``not_pinned``,
-    ``workflow_files``, ``action_files``.
+
+def parse_lockfile(content: str) -> dict[str, set[str]]:
+    """Parse an ``actions.lock`` file.
+
+    Returns the ``workflows`` map as ``{workflow_path: {owner/repo@ref, ...}}``.
+    Empty or malformed content yields an empty dict.
+    """
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    workflows = data.get("workflows")
+    if not isinstance(workflows, dict):
+        return {}
+
+    result: dict[str, set[str]] = {}
+    for path, deps in workflows.items():
+        if isinstance(deps, list):
+            result[str(path)] = {str(d) for d in deps}
+        else:
+            result[str(path)] = set()
+    return result
+
+
+def check_repo(org: str, repo_name: str) -> dict:
+    """Check a single repo for ``gh actions-lock`` adoption.
+
+    Returns a dict with keys: ``name``, ``has_workflows``,
+    ``external_workflows``, ``has_lockfile``, ``has_verify_workflow``,
+    ``locked_workflows``, ``uncovered_workflows``, ``compliant``,
+    ``sha_pinning_required``, ``workflow_files``, ``action_files``.
+
+    ``compliant`` is ``None`` when there is nothing to adopt (no workflow
+    references an external action), otherwise ``True`` when the lockfile
+    covers every workflow with external actions and the verify workflow
+    exists.
     """
     sha_pinning_required = get_sha_pinning_required(org, repo_name)
     workflow_files = get_workflow_files(org, repo_name)
     action_files = get_action_files(org, repo_name)
 
-    if not workflow_files and not action_files:
-        return {
-            "name": repo_name,
-            "has_workflows": False,
-            "all_pinned": None,
-            "sha_pinning_required": sha_pinning_required,
-            "sha_pinned": [],
-            "not_pinned": [],
-            "workflow_files": [],
-            "action_files": [],
-        }
-
-    all_sha_pinned: list[str] = []
-    all_not_pinned: list[str] = []
-
+    external_workflows: list[str] = []
     for wf in workflow_files:
-        path = f".github/workflows/{wf}"
+        path = f"{WORKFLOWS_DIR}/{wf}"
         content = get_file_content(org, repo_name, path)
         if not content:
             continue
         result = analyze_workflow(content)
-        all_sha_pinned.extend(result["sha_pinned"])
-        all_not_pinned.extend(result["not_pinned"])
+        if result["sha_pinned"] or result["not_pinned"]:
+            external_workflows.append(path)
+    external_workflows.sort()
 
-    for af in action_files:
-        content = get_file_content(org, repo_name, af)
-        if not content:
-            continue
-        result = analyze_workflow(content)
-        all_sha_pinned.extend(result["sha_pinned"])
-        all_not_pinned.extend(result["not_pinned"])
+    lockfile_content = get_lockfile(org, repo_name)
+    has_lockfile = bool(lockfile_content)
+    locked = parse_lockfile(lockfile_content)
+    locked_workflows = sorted(locked)
+    uncovered_workflows = [p for p in external_workflows if p not in locked]
+    has_verify_workflow = VERIFY_WORKFLOW_NAME in workflow_files
 
-    has_actions = len(all_sha_pinned) + len(all_not_pinned) > 0
-    all_pinned = has_actions and len(all_not_pinned) == 0
+    compliant: bool | None
+    if not external_workflows:
+        compliant = None
+    else:
+        compliant = has_lockfile and has_verify_workflow and not uncovered_workflows
 
     return {
         "name": repo_name,
-        "has_workflows": True,
-        "all_pinned": all_pinned if has_actions else None,
+        "has_workflows": bool(workflow_files),
+        "external_workflows": external_workflows,
+        "has_lockfile": has_lockfile,
+        "has_verify_workflow": has_verify_workflow,
+        "locked_workflows": locked_workflows,
+        "uncovered_workflows": uncovered_workflows,
+        "compliant": compliant,
         "sha_pinning_required": sha_pinning_required,
-        "sha_pinned": sorted(set(all_sha_pinned)),
-        "not_pinned": sorted(set(all_not_pinned)),
         "workflow_files": workflow_files,
         "action_files": action_files,
     }

@@ -5,8 +5,28 @@ build-backend = "hatchling.build"
 [project]
 name = "workflow-shas"
 version = "0.1.0"
-description = "Track and enforce GitHub Actions SHA pinning across a GitHub organization."
+description = "Track and enforce gh-actions-lock adoption for GitHub Actions across a GitHub organization."
 requires-python = ">=3.11"
+dependencies = ["pyyaml"]
 
 [project.scripts]
 workflow-shas = "workflow_shas.cli:main"
+
+[dependency-groups]
+dev = ["pytest", "pytest-cov", "ruff"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["workflow_shas"]
+omit = ["workflow_shas/__main__.py"]

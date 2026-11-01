@@ -1,7 +1,8 @@
 """Enable SHA pinning enforcement on repos where it's safe to do so.
 
 "Safe" means the repo either has no workflows, has workflows with no
-external action references, or is already fully SHA-pinned.
+external action references, or has already adopted ``gh actions-lock``
+(the lockfile satisfies ``sha_pinning_required``).
 """
 
 from __future__ import annotations
@@ -59,14 +60,14 @@ def run(
         if not result["has_workflows"]:
             print("no workflows -> safe")
             safe.append((result, "no workflows"))
-        elif result["all_pinned"] is None:
+        elif result["compliant"] is None:
             print("no external actions -> safe")
             safe.append((result, "no external actions"))
-        elif result["all_pinned"]:
-            print("fully pinned -> safe")
-            safe.append((result, "fully pinned"))
+        elif result["compliant"]:
+            print("lockfile adopted -> safe")
+            safe.append((result, "lockfile adopted"))
         else:
-            print("has unpinned actions -> skip")
+            print("not yet adopted -> skip")
 
     print()
 

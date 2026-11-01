@@ -1,17 +1,20 @@
-"""CLI entrypoint with subcommands: check, pin, enforce."""
+"""CLI entrypoint with subcommands: check, lock, enforce."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from .commands import check, enforce, pin
+from .commands import check, enforce, lock
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="workflow-shas",
-        description="Track and enforce GitHub Actions SHA pinning across a GitHub organization.",
+        description=(
+            "Track and enforce gh-actions-lock adoption for GitHub Actions "
+            "across a GitHub organization."
+        ),
     )
     parser.add_argument(
         "--org",
@@ -28,8 +31,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     check_parser.add_argument(
         "--tracking-repo",
-        required=True,
-        help="Repo name (not full slug) for the tracking issue (e.g. 'workflow-shas').",
+        default="",
+        help=(
+            "Repo name (not full slug) for the tracking issue (e.g. 'workflow-shas'). "
+            "Required unless --dry-run is set."
+        ),
     )
     check_parser.add_argument(
         "--dry-run",
@@ -45,24 +51,24 @@ def main(argv: list[str] | None = None) -> None:
         help="Process specific repo(s). Repeatable: --repo a --repo b",
     )
 
-    # --- pin ---
-    pin_parser = subparsers.add_parser(
-        "pin",
-        help="Pin action refs to SHAs and open PRs.",
+    # --- lock ---
+    lock_parser = subparsers.add_parser(
+        "lock",
+        help="Run gh actions-lock in repos and open PRs.",
     )
-    pin_parser.add_argument(
+    lock_parser.add_argument(
         "--workspace",
         type=Path,
         default=Path.cwd(),
         help="Parent directory for repo clones/worktrees (default: cwd).",
     )
-    pin_parser.add_argument(
+    lock_parser.add_argument(
         "--results-file",
         type=Path,
         default=Path.cwd() / "results.json",
         help="Path to results.json from a previous check run.",
     )
-    pin_parser.add_argument(
+    lock_parser.add_argument(
         "--repo",
         type=str,
         action="append",
@@ -70,22 +76,22 @@ def main(argv: list[str] | None = None) -> None:
         dest="repos",
         help="Process specific repo(s). Repeatable: --repo a --repo b",
     )
-    pin_parser.add_argument(
+    lock_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Make local changes only — no commit, push, or PR.",
+        help="Make local changes only - no commit, push, or PR.",
     )
-    pin_parser.add_argument(
+    lock_parser.add_argument(
         "--no-push",
         action="store_true",
         help="Commit locally but do not push or open a PR.",
     )
-    pin_parser.add_argument(
+    lock_parser.add_argument(
         "--no-pr",
         action="store_true",
         help="Commit and push but do not open a PR.",
     )
-    pin_parser.add_argument(
+    lock_parser.add_argument(
         "--reset",
         action="store_true",
         help="Discard prior local changes/worktrees before processing.",
@@ -113,14 +119,18 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "check":
+        if not args.dry_run and not args.tracking_repo:
+            parser.error(
+                "--tracking-repo is required for the check command unless --dry-run is set"
+            )
         check.run(
             org=args.org,
             tracking_repo=args.tracking_repo,
             repos=args.repos,
             dry_run=args.dry_run,
         )
-    elif args.command == "pin":
-        pin.run(
+    elif args.command == "lock":
+        lock.run(
             org=args.org,
             workspace=args.workspace,
             results_file=args.results_file,
@@ -130,7 +140,7 @@ def main(argv: list[str] | None = None) -> None:
             no_pr=args.no_pr,
             reset=args.reset,
         )
-    elif args.command == "enforce":
+    else:  # args.command == "enforce" (subparsers are required)
         enforce.run(
             org=args.org,
             repos=args.repos,

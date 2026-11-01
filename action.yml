@@ -1,18 +1,18 @@
 name: "Workflow SHAs"
-description: "Track and enforce GitHub Actions SHA pinning across a GitHub organization."
+description: "Track and enforce gh-actions-lock adoption for GitHub Actions across a GitHub organization."
 branding:
   icon: shield
   color: blue
 
 inputs:
   command:
-    description: "Subcommand to run: check, pin, or enforce."
+    description: "Subcommand to run: check, lock, or enforce."
     required: true
   org:
     description: "GitHub organization to operate on."
     required: true
   tracking-repo:
-    description: "Repo name for the tracking issue (required for 'check' command)."
+    description: "Repo name for the tracking issue (required for 'check' command unless dry-run is enabled)."
     required: false
     default: ""
   repos:
@@ -35,6 +35,13 @@ runs:
     - name: Install uv
       uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
 
+    - name: Install gh-actions-lock
+      shell: bash
+      run: |
+        if ! gh extension list | grep -q 'gh-actions-lock'; then
+          gh extension install github/gh-actions-lock --pin v0.4.0
+        fi
+
     - name: Run workflow-shas
       shell: bash
       working-directory: ${{ github.action_path }}
@@ -43,11 +50,13 @@ runs:
 
         # Command-specific args
         if [ "${{ inputs.command }}" = "check" ]; then
-          if [ -z "${{ inputs.tracking-repo }}" ]; then
-            echo "::error::tracking-repo input is required for the check command"
+          if [ -z "${{ inputs.tracking-repo }}" ] && [ "${{ inputs.dry-run }}" != "true" ]; then
+            echo "::error::tracking-repo input is required for the check command unless dry-run is enabled"
             exit 1
           fi
-          args="$args --tracking-repo ${{ inputs.tracking-repo }}"
+          if [ -n "${{ inputs.tracking-repo }}" ]; then
+            args="$args --tracking-repo ${{ inputs.tracking-repo }}"
+          fi
         fi
 
         # Repo filter
