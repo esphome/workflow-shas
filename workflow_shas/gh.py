@@ -38,3 +38,10 @@ def gh_api_json(endpoint: str, **kwargs: str) -> dict | list:
     for k, v in kwargs.items():
         args.extend([f"--{k}", v])
     return json.loads(run_gh(*args))
+
+
+def run_actions_lock(
+    *args: str, cwd: Path | None = None, check: bool = True
+) -> subprocess.CompletedProcess:
+    """Run ``gh actions-lock`` with the given arguments."""
+    return run_cmd("gh", "actions-lock", *args, cwd=cwd, check=check)

@@ -1,33 +1,68 @@
-"""Pin GitHub Actions to SHAs across organization repositories.
+"""Adopt ``gh actions-lock`` across organization repositories.
 
-For each repo with unpinned action references:
+For each repo that has not yet adopted the lockfile:
 1. Clones the repo (or reuses an existing worktree)
 2. Creates a branch
-3. Resolves all action/workflow refs to commit SHAs inline
-4. Commits, pushes, and opens a PR
+3. Runs ``gh actions-lock`` (writes ``.github/workflows/actions.lock`` and
+   rewrites inline SHA pins back to version tags)
+4. Adds the ``verify-lockfile.yml`` workflow and locks it too
+5. Commits, pushes, and opens a PR
 """
 
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
-from ..gh import run_cmd, run_gh
-from ..scan import SHA_PATTERN
+from ..gh import run_actions_lock, run_cmd, run_gh
 from .check import SUB_ISSUE_TITLE
 
-BRANCH_NAME = "pin-action-shas"
+BRANCH_NAME = "adopt-actions-lock"
+WORKTREE_NAME = "actions-lock"
 
-# Matches both step-level and job-level uses: — captures the prefix so
-# the replacement can preserve original whitespace.
-USES_PATTERN = re.compile(r"(uses:\s*)([^@\s]+)@(\S+)")
+# Rewrite workspace-local ``uses: ./foo`` references to repo-relative
+# ``$/foo`` so gh actions-lock can follow them and lock their dependencies.
+# Without this, once a lockfile exists GitHub's sha_pinning_required
+# enforcement rejects any action reached through a local composite action
+# because it is not recorded in the lockfile.
+MIGRATE_LOCAL_ACTIONS_FLAG = "--migrate-local-actions"
 
-# A short version tag lacks a full semver: "v4", "v4.1" but NOT "v4.3.1"
-SHORT_VERSION_PATTERN = re.compile(r"^v\d+(\.\d+)?$")
+# Always passed so the tool never waits on an interactive prompt.
+BASE_LOCK_ARGS = ("--no-interactive", MIGRATE_LOCAL_ACTIONS_FLAG)
 
-PR_TITLE = "Pin GitHub Actions to commit SHAs"
+PR_TITLE = "Adopt gh actions-lock for GitHub Actions pinning"
+
+VERIFY_WORKFLOW_PATH = ".github/workflows/verify-lockfile.yml"
+
+VERIFY_WORKFLOW_TEMPLATE = """\
+name: verify-lockfile
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify actions lockfile
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install gh-actions-lock
+        run: gh extension install github/gh-actions-lock --pin v0.4.0
+      - name: Verify lockfile
+        run: gh actions-lock --verify
+"""
 
 
 def pr_body(issue_number: int | None = None) -> str:
@@ -39,29 +74,34 @@ def pr_body(issue_number: int | None = None) -> str:
     return f"""\
 ## Summary
 
-Pin all GitHub Action and reusable workflow references to their full commit SHAs
-instead of mutable tags or branch names.{closes}
+Adopt [`gh actions-lock`](https://github.com/github/gh-actions-lock) to lock \
+GitHub Action and reusable workflow references to immutable commit SHAs.{closes}
+
+## What changed
+
+- `uses:` lines now reference readable version tags (for example \
+`actions/checkout@v7.0.1`). Any inline commit SHAs were rewritten back to \
+version tags.
+- The commit SHA of every direct and transitive action is recorded in \
+`.github/workflows/actions.lock`.
+- `.github/workflows/verify-lockfile.yml` runs `gh actions-lock --verify` on \
+every pull request and push to `main`, so drift or tampering is caught before \
+a workflow runs.
 
 ## Why?
 
-Referencing actions by tag (e.g., `actions/checkout@v4`) is convenient but
-carries a supply-chain risk: tags are mutable and can be force-pushed to point
-at arbitrary commits. If an action's tag is compromised, every workflow that
+Referencing actions by tag (e.g., `actions/checkout@v4`) is convenient but \
+carries a supply-chain risk: tags are mutable and can be force-pushed to point \
+at arbitrary commits. If an action's tag is compromised, every workflow that \
 references it by tag will silently run the attacker's code.
 
-Pinning to a full 40-character commit SHA (e.g.,
-`actions/checkout@11bd719...`) makes the reference immutable. Even if a tag is
-tampered with, workflows pinned to a SHA will continue to use the exact code
-that was reviewed and trusted.
-
-A version comment is included next to each SHA for readability
-(e.g., `actions/checkout@11bd719... # v4.2.2`).
+The lockfile pins every action to a full commit SHA while keeping workflow \
+files readable, and changes to the lockfile show up in pull request diffs. It \
+also satisfies GitHub's `sha_pinning_required` setting.
 
 ## References
 
-- [GitHub Blog: Four tips to keep your GitHub Actions workflows secure]\
-(https://github.blog/open-source/four-tips-to-keep-your-github-actions-workflows-secure/\
-#use-specific-action-version-tags)
+- [github/gh-actions-lock](https://github.com/github/gh-actions-lock)
 - [GitHub Docs: Security hardening for GitHub Actions]\
 (https://docs.github.com/en/actions/security-for-github-actions/security-guides/\
 security-hardening-for-github-actions#using-third-party-actions)
@@ -77,14 +117,14 @@ def get_default_branch(org: str, repo_name: str) -> str:
     return run_gh("api", f"repos/{org}/{repo_name}", "--jq", ".default_branch").strip()
 
 
-def get_unpinned_repos(results_file: Path) -> list[dict]:
-    """Load results.json and return repos that have unpinned actions."""
+def get_noncompliant_repos(results_file: Path) -> list[dict]:
+    """Load results.json and return repos that have not adopted the lockfile."""
     if not results_file.exists():
         print(f"Error: {results_file} not found. Run the check command first.")
         sys.exit(1)
 
     results = json.loads(results_file.read_text())
-    return [r for r in results if r.get("all_pinned") is False]
+    return [r for r in results if r.get("compliant") is False]
 
 
 def ensure_repo(org: str, repo_name: str, workspace: Path) -> Path:
@@ -95,7 +135,7 @@ def ensure_repo(org: str, repo_name: str, workspace: Path) -> Path:
     """
     existing = workspace / repo_name
     worktree_base = workspace / f"{repo_name}.worktrees"
-    worktree_dir = worktree_base / "pin-shas"
+    worktree_dir = worktree_base / WORKTREE_NAME
 
     if existing.is_dir() and (existing / ".git").exists():
         if worktree_dir.exists():
@@ -105,7 +145,7 @@ def ensure_repo(org: str, repo_name: str, workspace: Path) -> Path:
         default_branch = get_default_branch(org, repo_name)
         run_cmd("git", "fetch", "origin", default_branch, cwd=existing)
 
-        # Ensure the main clone isn't sitting on the pin branch
+        # Ensure the main clone isn't sitting on the lock branch
         current = run_cmd("git", "branch", "--show-current", cwd=existing, check=False)
         if current.stdout.strip() == BRANCH_NAME:
             run_cmd("git", "checkout", default_branch, cwd=existing, check=False)
@@ -163,7 +203,7 @@ def ensure_repo(org: str, repo_name: str, workspace: Path) -> Path:
 def reset_repo(org: str, repo_name: str, workspace: Path) -> None:
     """Reset any local changes / worktrees for a repo and delete the branch."""
     existing = workspace / repo_name
-    worktree_dir = workspace / f"{repo_name}.worktrees" / "pin-shas"
+    worktree_dir = workspace / f"{repo_name}.worktrees" / WORKTREE_NAME
 
     if worktree_dir.exists() and existing.is_dir():
         run_cmd(
@@ -200,189 +240,50 @@ def reset_repo(org: str, repo_name: str, workspace: Path) -> None:
             print(f"    Deleted remote branch {BRANCH_NAME}")
 
 
-def _repo_slug(action: str) -> str:
-    """Extract owner/repo from an action or reusable workflow reference."""
-    parts = action.split("/")
-    return f"{parts[0]}/{parts[1]}"
+def migrate_repo(work_dir: Path) -> bool:
+    """Run ``gh actions-lock`` and add the verify workflow.
 
+    ``gh actions-lock`` writes the lockfile, rewrites inline SHA pins back to
+    version tags, and (via ``--migrate-local-actions``) rewrites local
+    ``./foo`` references to repo-relative ``$/foo`` so their dependencies are
+    locked too. The verify workflow is added when missing and then locked by
+    a second run.
 
-def resolve_ref_to_sha(repo_slug: str, ref: str) -> str | None:
-    """Resolve a tag or branch name to its commit SHA.
-
-    Handles both lightweight and annotated tags, and branch refs.
+    Returns True if the working tree has any changes afterwards.
     """
-    for ref_type in ("tags", "heads"):
-        try:
-            output = run_gh(
-                "api",
-                f"repos/{repo_slug}/git/ref/{ref_type}/{ref}",
-                "--jq",
-                ".object.type,.object.sha",
-            )
-        except RuntimeError:
-            continue
+    run_actions_lock(*BASE_LOCK_ARGS, cwd=work_dir)
 
-        lines = output.strip().split("\n")
-        if len(lines) != 2:
-            continue
+    verify_path = work_dir / VERIFY_WORKFLOW_PATH
+    if not verify_path.exists():
+        verify_path.parent.mkdir(parents=True, exist_ok=True)
+        verify_path.write_text(VERIFY_WORKFLOW_TEMPLATE)
+        print(f"    Added {VERIFY_WORKFLOW_PATH}")
+        run_actions_lock(*BASE_LOCK_ARGS, cwd=work_dir)
 
-        obj_type, obj_sha = lines[0].strip(), lines[1].strip()
-
-        if obj_type == "commit":
-            return obj_sha
-
-        if obj_type == "tag":
-            try:
-                commit_sha = run_gh(
-                    "api",
-                    f"repos/{repo_slug}/git/tags/{obj_sha}",
-                    "--jq",
-                    ".object.sha",
-                ).strip()
-                return commit_sha
-            except RuntimeError:
-                return None
-
-    return None
+    return has_changes(work_dir)
 
 
-def resolve_full_version_tag(repo_slug: str, sha: str, original_ref: str) -> str:
-    """Find the most specific version tag pointing at a given SHA.
-
-    Given that we resolved 'v4' to SHA abc123, check if there's a more
-    specific tag like 'v4.3.1' pointing to the same commit.
-    """
-    if not SHORT_VERSION_PATTERN.match(original_ref):
-        return original_ref
-
+def verify_lockfile(work_dir: Path) -> bool:
+    """Return True if ``gh actions-lock --no-fix --json`` reports a valid lockfile."""
+    result = run_actions_lock(
+        "--no-fix", "--json", *BASE_LOCK_ARGS, cwd=work_dir, check=False
+    )
     try:
-        output = run_gh(
-            "api",
-            f"repos/{repo_slug}/tags",
-            "--paginate",
-            "--jq",
-            f'.[] | select(.commit.sha == "{sha}") | .name',
-        )
-    except RuntimeError:
-        return original_ref
-
-    tags = [t.strip() for t in output.strip().split("\n") if t.strip()]
-    if not tags:
-        return original_ref
-
-    prefix = original_ref.rstrip(".") + "."
-    candidates = [t for t in tags if t == original_ref or t.startswith(prefix)]
-    if not candidates:
-        return original_ref
-
-    candidates.sort(key=lambda t: t.count("."), reverse=True)
-    return candidates[0]
-
-
-def _pin_file(
-    wf_file: Path,
-    cache: dict[tuple[str, str], tuple[str, str] | None],
-) -> bool:
-    """Pin action refs in a single file. Returns True if the file was modified."""
-    content = wf_file.read_text()
-    new_content = content
-
-    for match in USES_PATTERN.finditer(content):
-        prefix = match.group(1)
-        action = match.group(2)
-        ref = match.group(3)
-
-        if " " in ref:
-            ref = ref.split()[0]
-
-        if action.startswith("./") or action.startswith("docker://"):
-            continue
-
-        if SHA_PATTERN.match(ref):
-            continue
-
-        repo_slug = _repo_slug(action)
-        cache_key = (repo_slug, ref)
-
-        if cache_key not in cache:
-            sha = resolve_ref_to_sha(repo_slug, ref)
-            if sha is None:
-                print(f"    WARNING: could not resolve {action}@{ref}")
-                cache[cache_key] = None
-            else:
-                version_tag = resolve_full_version_tag(repo_slug, sha, ref)
-                cache[cache_key] = (sha, version_tag)
-
-        resolved = cache[cache_key]
-        if resolved is None:
-            continue
-
-        sha, version_tag = resolved
-        old_text = f"{prefix}{action}@{match.group(3)}"
-        new_text = f"{prefix}{action}@{sha}  # {version_tag}"
-        new_content = new_content.replace(old_text, new_text, 1)
-
-        if version_tag != ref:
-            print(
-                f"    {wf_file.name}: {action}@{ref} -> @{sha[:12]}... # {version_tag}"
-            )
-        else:
-            print(f"    {wf_file.name}: {action}@{ref} -> @{sha[:12]}... # {ref}")
-
-    if new_content != content:
-        wf_file.write_text(new_content)
-        return True
-    return False
-
-
-def pin_actions(work_dir: Path) -> bool:
-    """Rewrite all action and reusable workflow refs to SHA pins.
-
-    Processes .github/workflows/*.yml and any action.yml/action.yaml
-    files found anywhere in the repo.
-
-    Returns True if any files were modified.
-    """
-    cache: dict[tuple[str, str], tuple[str, str] | None] = {}
-
-    files_to_pin: list[Path] = []
-
-    # Workflow files
-    workflows_dir = work_dir / ".github" / "workflows"
-    if workflows_dir.is_dir():
-        files_to_pin.extend(sorted(workflows_dir.glob("*.y*ml")))
-
-    # Action definition files anywhere in the repo
-    for action_file in sorted(work_dir.rglob("action.y*ml")):
-        if action_file.name in ("action.yml", "action.yaml"):
-            files_to_pin.append(action_file)
-
-    if not files_to_pin:
-        print("    No workflow or action files found")
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError:
         return False
-
-    for f in files_to_pin:
-        _pin_file(f, cache)
-
-    # Check via git diff whether anything actually changed on disk
-    result = run_cmd("git", "diff", "--quiet", cwd=work_dir, check=False)
-    return result.returncode != 0
+    return isinstance(report, dict) and report.get("valid") is True
 
 
 def has_changes(work_dir: Path) -> bool:
-    """Check if the working directory has uncommitted changes."""
-    result = run_cmd("git", "diff", "--quiet", cwd=work_dir, check=False)
-    return result.returncode != 0
+    """Check if the working directory has uncommitted or untracked changes."""
+    result = run_cmd("git", "status", "--porcelain", cwd=work_dir)
+    return bool(result.stdout.strip())
 
 
 def commit_changes(work_dir: Path) -> None:
-    """Stage and commit the pinning changes."""
-    run_cmd("git", "add", ".github/workflows/", cwd=work_dir)
-    # Stage any action.yml/action.yaml files anywhere in the repo
-    for action_file in work_dir.rglob("action.y*ml"):
-        if action_file.name in ("action.yml", "action.yaml"):
-            rel = action_file.relative_to(work_dir)
-            run_cmd("git", "add", str(rel), cwd=work_dir)
+    """Stage and commit the lockfile and workflow changes."""
+    run_cmd("git", "add", ".github/", cwd=work_dir)
 
     result = run_cmd("git", "diff", "--cached", "--quiet", cwd=work_dir, check=False)
     if result.returncode == 0:
@@ -393,10 +294,10 @@ def commit_changes(work_dir: Path) -> None:
         "git",
         "commit",
         "-m",
-        "Pin GitHub Actions to commit SHAs\n\n"
-        "Replace mutable tag references with immutable commit SHAs\n"
-        "to prevent supply-chain attacks via compromised tags.\n"
-        "Version comments are preserved for readability.",
+        "Adopt gh actions-lock for GitHub Actions pinning\n\n"
+        "Lock action references to commit SHAs in .github/workflows/actions.lock\n"
+        "and keep version tags in uses: lines. Add a verify-lockfile workflow\n"
+        "that runs gh actions-lock --verify to catch drift or tampering.",
         cwd=work_dir,
     )
     print("    Committed changes")
@@ -411,7 +312,7 @@ def push_branch(work_dir: Path) -> None:
 
 
 def find_repo_issue(org: str, repo_name: str) -> int | None:
-    """Find the open SHA pinning issue number in a repo, if any."""
+    """Find the open lockfile adoption issue number in a repo, if any."""
     full_name = f"{org}/{repo_name}"
     try:
         issues = json.loads(
@@ -516,18 +417,22 @@ def process_repo(
             reset_repo(org, repo_name, workspace)
 
         work_dir = ensure_repo(org, repo_name, workspace)
-        changed = pin_actions(work_dir)
+        changed = migrate_repo(work_dir)
 
-        if not changed and not has_changes(work_dir):
+        if not changed:
             print("    No changes needed")
             summary["status"] = "no_changes"
             return summary
 
         if dry_run:
             diff = run_cmd("git", "diff", "--stat", cwd=work_dir, check=False)
-            print(f"    [dry-run] Changes:\n{diff.stdout}")
+            status = run_cmd("git", "status", "--short", cwd=work_dir, check=False)
+            print(f"    [dry-run] Changes:\n{diff.stdout}{status.stdout}")
             summary["status"] = "dry_run"
             return summary
+
+        if not verify_lockfile(work_dir):
+            print("    WARNING: gh actions-lock reports the lockfile is not valid")
 
         commit_changes(work_dir)
 
@@ -569,7 +474,7 @@ def run(
     no_pr: bool = False,
     reset: bool = False,
 ) -> None:
-    """Run the pin command."""
+    """Run the lock command."""
     # Resolve effective flags
     if dry_run:
         no_push = True
@@ -589,25 +494,25 @@ def run(
         print("Reset: YES (prior changes will be discarded)")
     print()
 
-    unpinned = get_unpinned_repos(results_file)
+    pending = get_noncompliant_repos(results_file)
     if repos:
         repo_set = set(repos)
-        unpinned = [r for r in unpinned if r["name"] in repo_set]
-        missing = repo_set - {r["name"] for r in unpinned}
+        pending = [r for r in pending if r["name"] in repo_set]
+        missing = repo_set - {r["name"] for r in pending}
         if missing:
             print(
-                f"Error: repos not found in unpinned list: {', '.join(sorted(missing))}"
+                f"Error: repos not found in the not-adopted list: {', '.join(sorted(missing))}"
             )
             print("Run the check command first, or check the names.")
             sys.exit(1)
 
-    print(f"Found {len(unpinned)} repos with unpinned actions\n")
+    print(f"Found {len(pending)} repos that have not adopted gh actions-lock\n")
 
     summaries = []
-    for i, repo_info in enumerate(sorted(unpinned, key=lambda r: r["name"]), 1):
+    for i, repo_info in enumerate(sorted(pending, key=lambda r: r["name"]), 1):
         name = repo_info["name"]
-        count = len(repo_info["not_pinned"])
-        print(f"[{i}/{len(unpinned)}] {name} ({count} unpinned actions)")
+        count = len(repo_info.get("external_workflows", []))
+        print(f"[{i}/{len(pending)}] {name} ({count} workflows with external actions)")
 
         summary = process_repo(
             org,

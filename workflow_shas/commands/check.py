@@ -1,8 +1,8 @@
-"""Check SHA pinning compliance and manage tracking issues.
+"""Check gh-actions-lock adoption and manage tracking issues.
 
 Scans all repos in an org, creates/updates a pinned tracking issue in
-a designated tracking repo, and creates sub-issues in each non-compliant
-repository.
+a designated tracking repo, and creates sub-issues in each repository
+that has not yet adopted ``gh actions-lock``.
 """
 
 from __future__ import annotations
@@ -11,47 +11,75 @@ import json
 from pathlib import Path
 
 from ..gh import gh_api_json, run_gh
-from ..scan import check_repo, get_repos
+from ..scan import (
+    LOCKFILE_PATH,
+    VERIFY_WORKFLOW_NAME,
+    WORKFLOWS_DIR,
+    check_repo,
+    get_repos,
+)
 
 # Title used to find/create the parent tracking issue
-TRACKING_ISSUE_TITLE = "GitHub Actions SHA Pinning Compliance"
+TRACKING_ISSUE_TITLE = "GitHub Actions Lockfile Adoption"
 
 # Title prefix used for sub-issues in each repo
-SUB_ISSUE_TITLE = "Pin GitHub Actions to commit SHAs"
+SUB_ISSUE_TITLE = "Adopt gh actions-lock for GitHub Actions"
 
 SUB_ISSUE_BODY_TEMPLATE = """\
 GitHub Actions in this repository reference actions or reusable workflows \
-by mutable tag or branch instead of an immutable commit SHA.
+by mutable tag or branch, and are not yet locked with \
+[`gh actions-lock`](https://github.com/github/gh-actions-lock).
 
-Pinning to a full 40-character commit SHA prevents supply-chain attacks \
-where a compromised or force-pushed tag silently changes the code your \
-workflows execute.
+`gh actions-lock` keeps readable version tags in your `uses:` lines and \
+records the exact commit SHA of every direct and transitive action in \
+`.github/workflows/actions.lock`. A compromised or force-pushed tag can no \
+longer silently change the code your workflows execute, and changes to the \
+lockfile are visible in pull request diffs.
 
-### Unpinned references
+### What is missing
 
-{unpinned_list}
+{missing}
 
 ### What to do
 
-Replace each tag/branch reference with its commit SHA and add a version comment:
+1. Install the extension and generate the lockfile:
 
-```yaml
-# Before
-uses: actions/checkout@v4
+   ```sh
+   gh extension install github/gh-actions-lock
+   gh actions-lock
+   ```
 
-# After
-uses: actions/checkout@11bd719...  # v4.2.2
-```
+   Keep version tags in `uses:` (for example `actions/checkout@v7.0.1`). \
+Any inline commit SHAs are rewritten back to version tags automatically.
+
+2. Add `.github/workflows/verify-lockfile.yml`, which runs \
+`gh actions-lock --verify` on every pull request and push to catch drift \
+or tampering.
+
+3. Commit `.github/workflows/actions.lock` and the verify workflow.
 
 ### References
 
-- [GitHub Blog: Four tips to keep your GitHub Actions workflows secure]\
-(https://github.blog/open-source/four-tips-to-keep-your-github-actions-workflows-secure/\
-#use-specific-action-version-tags)
+- [github/gh-actions-lock](https://github.com/github/gh-actions-lock)
 - [GitHub Docs: Security hardening for GitHub Actions]\
 (https://docs.github.com/en/actions/security-for-github-actions/security-guides/\
 security-hardening-for-github-actions#using-third-party-actions)
 """
+
+
+def format_missing(result: dict) -> str:
+    """Describe what a repo still needs to adopt ``gh actions-lock``."""
+    items: list[str] = []
+    if not result["has_lockfile"]:
+        items.append(f"- No lockfile found at `{LOCKFILE_PATH}`")
+    elif result["uncovered_workflows"]:
+        items.append("- Workflows not covered by the lockfile:")
+        items.extend(f"  - `{wf}`" for wf in sorted(result["uncovered_workflows"]))
+    if not result["has_verify_workflow"]:
+        items.append(
+            f"- No verify workflow found at `{WORKFLOWS_DIR}/{VERIFY_WORKFLOW_NAME}`"
+        )
+    return "\n".join(items)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +178,7 @@ def get_existing_sub_issues(tracking_repo: str, issue_number: int) -> list[dict]
 
 
 def find_repo_issue(org: str, repo_name: str) -> dict | None:
-    """Find an existing SHA pinning issue in a specific repo."""
+    """Find an existing lockfile adoption issue in a specific repo."""
     full_name = f"{org}/{repo_name}"
     try:
         issues = json.loads(
@@ -177,11 +205,10 @@ def find_repo_issue(org: str, repo_name: str) -> dict | None:
     return None
 
 
-def create_sub_issue(org: str, repo_name: str, not_pinned: list[str]) -> dict | None:
+def create_sub_issue(org: str, repo_name: str, result: dict) -> dict | None:
     """Create a sub-issue in the target repo."""
     full_name = f"{org}/{repo_name}"
-    unpinned_list = "\n".join(f"- `{action}`" for action in sorted(not_pinned))
-    body = SUB_ISSUE_BODY_TEMPLATE.format(unpinned_list=unpinned_list)
+    body = SUB_ISSUE_BODY_TEMPLATE.format(missing=format_missing(result))
 
     try:
         url = run_gh(
@@ -206,13 +233,10 @@ def create_sub_issue(org: str, repo_name: str, not_pinned: list[str]) -> dict | 
         return None
 
 
-def update_sub_issue(
-    org: str, repo_name: str, issue_number: int, not_pinned: list[str]
-) -> None:
+def update_sub_issue(org: str, repo_name: str, issue_number: int, result: dict) -> None:
     """Update the body of an existing sub-issue."""
     full_name = f"{org}/{repo_name}"
-    unpinned_list = "\n".join(f"- `{action}`" for action in sorted(not_pinned))
-    body = SUB_ISSUE_BODY_TEMPLATE.format(unpinned_list=unpinned_list)
+    body = SUB_ISSUE_BODY_TEMPLATE.format(missing=format_missing(result))
 
     try:
         run_gh(
@@ -291,10 +315,10 @@ def format_table(headers: list[str], rows: list[list[str]]) -> list[str]:
 
 def generate_tracking_body(org: str, results: list[dict]) -> str:
     """Generate the markdown body for the tracking issue."""
-    pinned = [r for r in results if r["all_pinned"] is True]
-    not_pinned = [r for r in results if r["all_pinned"] is False]
+    adopted = [r for r in results if r["compliant"] is True]
+    not_adopted = [r for r in results if r["compliant"] is False]
     no_workflows = [r for r in results if not r["has_workflows"]]
-    no_actions = [r for r in results if r["has_workflows"] and r["all_pinned"] is None]
+    no_actions = [r for r in results if r["has_workflows"] and r["compliant"] is None]
 
     enforced_count = sum(1 for r in results if r["sha_pinning_required"] is True)
     not_enforced_count = sum(1 for r in results if r["sha_pinning_required"] is False)
@@ -307,56 +331,66 @@ def generate_tracking_body(org: str, results: list[dict]) -> str:
         return "?"
 
     lines = [
-        "This issue tracks SHA pinning compliance for GitHub Actions across "
-        f"all repositories in the [{org}](https://github.com/{org}) organization.",
+        "This issue tracks adoption of "
+        "[`gh actions-lock`](https://github.com/github/gh-actions-lock) for "
+        "GitHub Actions across all repositories in the "
+        f"[{org}](https://github.com/{org}) organization.",
         "",
-        "**SHA pinning** means referencing actions by their full commit SHA "
-        "(e.g., `actions/checkout@<sha>`) instead of a mutable tag "
-        "(e.g., `actions/checkout@v4`). This prevents supply-chain attacks "
-        "via compromised or force-pushed tags.",
+        "**`gh actions-lock`** keeps version tags in `uses:` lines and records "
+        f"the exact commit SHA of every action in `{LOCKFILE_PATH}`. A "
+        f"`{VERIFY_WORKFLOW_NAME}` workflow runs `gh actions-lock --verify` on "
+        "every pull request to catch drift or tampering. This prevents "
+        "supply-chain attacks via compromised or force-pushed tags.",
+        "",
+        "A repository is **adopted** when every workflow with external actions "
+        "is covered by the lockfile and the verify workflow exists.",
         "",
         "The **Enforced** column shows whether the repo has `sha_pinning_required` "
-        "enabled in Settings > Actions > General.",
+        "enabled in Settings > Actions > General (the lockfile satisfies it).",
         "",
-        "Each non-compliant repository has a linked sub-issue with details.",
+        "Each repository that has not yet adopted the lockfile has a linked "
+        "sub-issue with details.",
         "",
         "### Summary",
         "",
-        f"- **{len(pinned)}** fully pinned",
-        f"- **{len(not_pinned)}** not fully pinned",
+        f"- **{len(adopted)}** adopted",
+        f"- **{len(not_adopted)}** not yet adopted",
         f"- **{len(no_actions)}** with workflows but no external actions",
         f"- **{len(no_workflows)}** without workflows",
         f"- **{enforced_count}** enforced / **{not_enforced_count}** not enforced",
         "",
     ]
 
-    if pinned:
-        lines.append("### Fully SHA-Pinned Repositories")
+    if adopted:
+        lines.append("### Compliant Repositories (Lockfile Adopted)")
         lines.append("")
         table_rows = []
-        for r in sorted(pinned, key=lambda x: x["name"]):
+        for r in sorted(adopted, key=lambda x: x["name"]):
             repo_link = f"[{r['name']}](https://github.com/{org}/{r['name']})"
-            wf_list = ", ".join(
-                [f"`{wf}`" for wf in sorted(r["workflow_files"])]
-                + [f"`{af}`" for af in sorted(r.get("action_files", []))]
-            )
+            wf_list = ", ".join(f"`{wf}`" for wf in sorted(r["workflow_files"]))
             table_rows.append([repo_link, enforcement_label(r), wf_list])
         lines.extend(
             format_table(["Repository", "Enforced", "Workflow Files"], table_rows)
         )
         lines.append("")
 
-    if not_pinned:
-        lines.append("### Repositories NOT Fully SHA-Pinned")
+    if not_adopted:
+        lines.append("### Repositories Not Yet Adopted")
         lines.append("")
         table_rows = []
-        for r in sorted(not_pinned, key=lambda x: x["name"]):
+        for r in sorted(not_adopted, key=lambda x: x["name"]):
             repo_link = f"[{r['name']}](https://github.com/{org}/{r['name']})"
-            unpinned = str(len(r["not_pinned"]))
-            pinned_count = str(len(r["sha_pinned"]))
-            table_rows.append([repo_link, enforcement_label(r), unpinned, pinned_count])
+            lockfile = "Yes" if r["has_lockfile"] else "No"
+            verify = "Yes" if r["has_verify_workflow"] else "No"
+            uncovered = str(len(r["uncovered_workflows"]))
+            table_rows.append(
+                [repo_link, enforcement_label(r), lockfile, verify, uncovered]
+            )
         lines.extend(
-            format_table(["Repository", "Enforced", "Unpinned", "Pinned"], table_rows)
+            format_table(
+                ["Repository", "Enforced", "Lockfile", "Verify Workflow", "Uncovered"],
+                table_rows,
+            )
         )
         lines.append("")
 
@@ -393,8 +427,6 @@ def run(
     dry_run: bool = False,
 ) -> None:
     """Run the check command."""
-    tracking_repo_full = f"{org}/{tracking_repo}"
-
     # --- Phase 1: Scan repos ---
     if repos:
         repo_names = sorted(repos)
@@ -414,33 +446,34 @@ def run(
         enforced = " [enforced]" if result["sha_pinning_required"] else ""
         if not result["has_workflows"]:
             print(f"no workflows{enforced}")
-        elif result["all_pinned"] is None:
+        elif result["compliant"] is None:
             print(f"no external actions{enforced}")
-        elif result["all_pinned"]:
-            print(f"fully pinned{enforced}")
+        elif result["compliant"]:
+            print(f"lockfile adopted{enforced}")
         else:
-            print(f"NOT pinned ({len(result['not_pinned'])} unpinned){enforced}")
+            print(f"NOT adopted{enforced}")
 
     # Save raw results
     json_path = Path(__file__).resolve().parent.parent.parent / "results.json"
     json_path.write_text(json.dumps(results, indent=2) + "\n")
     print(f"\nResults saved to {json_path}")
 
-    not_pinned_repos = [r for r in results if r["all_pinned"] is False]
-    compliant_repos = {r["name"] for r in results if r["all_pinned"] is not False}
+    noncompliant_repos = [r for r in results if r["compliant"] is False]
+    compliant_repos = {r["name"] for r in results if r["compliant"] is not False}
 
-    print(f"\n{len(not_pinned_repos)} non-compliant repos found")
+    print(f"\n{len(noncompliant_repos)} non-compliant repos found")
 
     if dry_run:
         print("\n[dry-run] Would create/update tracking issue with body:")
         print("---")
         print(generate_tracking_body(org, results))
         print("---")
-        for r in not_pinned_repos:
+        for r in noncompliant_repos:
             print(f"[dry-run] Would create/update sub-issue in {org}/{r['name']}")
         return
 
     # --- Phase 2: Manage tracking issue ---
+    tracking_repo_full = f"{org}/{tracking_repo}"
     print("\nManaging tracking issue...")
     tracking_body = generate_tracking_body(org, results)
 
@@ -464,17 +497,17 @@ def run(
 
     # --- Phase 3: Create/update sub-issues in non-compliant repos ---
     print("\nManaging sub-issues...")
-    for r in sorted(not_pinned_repos, key=lambda x: x["name"]):
+    for r in sorted(noncompliant_repos, key=lambda x: x["name"]):
         repo_name = r["name"]
         repo_full = f"{org}/{repo_name}"
         print(f"  {repo_name}:")
 
         existing = find_repo_issue(org, repo_name)
         if existing:
-            update_sub_issue(org, repo_name, existing["number"], r["not_pinned"])
+            update_sub_issue(org, repo_name, existing["number"], r)
             sub_issue_number = existing["number"]
         else:
-            created = create_sub_issue(org, repo_name, r["not_pinned"])
+            created = create_sub_issue(org, repo_name, r)
             if not created:
                 continue
             sub_issue_number = created["number"]
