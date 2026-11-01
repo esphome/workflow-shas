@@ -12,7 +12,6 @@ For each repo that has not yet adopted the lockfile:
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -22,15 +21,15 @@ from .check import SUB_ISSUE_TITLE
 BRANCH_NAME = "adopt-actions-lock"
 WORKTREE_NAME = "actions-lock"
 
-# gh actions-lock treats workspace-local ``uses: ./...`` references as errors
-# unless this flag is passed, because the lockfile cannot cover them.
-IGNORE_LOCAL_ACTIONS_FLAG = "--ignore-local-actions"
+# Rewrite workspace-local ``uses: ./foo`` references to repo-relative
+# ``$/foo`` so gh actions-lock can follow them and lock their dependencies.
+# Without this, once a lockfile exists GitHub's sha_pinning_required
+# enforcement rejects any action reached through a local composite action
+# because it is not recorded in the lockfile.
+MIGRATE_LOCAL_ACTIONS_FLAG = "--migrate-local-actions"
 
 # Always passed so the tool never waits on an interactive prompt.
-BASE_LOCK_ARGS = ("--no-interactive", IGNORE_LOCAL_ACTIONS_FLAG)
-
-# Matches a step-level or job-level ``uses: ./...`` reference.
-LOCAL_USES_PATTERN = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?\./", re.MULTILINE)
+BASE_LOCK_ARGS = ("--no-interactive", MIGRATE_LOCAL_ACTIONS_FLAG)
 
 PR_TITLE = "Adopt gh actions-lock for GitHub Actions pinning"
 
@@ -241,33 +240,14 @@ def reset_repo(org: str, repo_name: str, workspace: Path) -> None:
             print(f"    Deleted remote branch {BRANCH_NAME}")
 
 
-def uses_local_actions(work_dir: Path) -> bool:
-    """Return True if any workflow references a workspace-local ``./`` action."""
-    workflows_dir = work_dir / ".github" / "workflows"
-    if not workflows_dir.is_dir():
-        return False
-    return any(
-        LOCAL_USES_PATTERN.search(wf.read_text())
-        for wf in sorted(workflows_dir.glob("*.y*ml"))
-    )
-
-
-def render_verify_workflow(local_actions: bool) -> str:
-    """Render the verify workflow, tolerating local ``./`` actions if needed."""
-    if not local_actions:
-        return VERIFY_WORKFLOW_TEMPLATE
-    return VERIFY_WORKFLOW_TEMPLATE.replace(
-        "run: gh actions-lock --verify\n",
-        f"run: gh actions-lock --verify {IGNORE_LOCAL_ACTIONS_FLAG}\n",
-    )
-
-
 def migrate_repo(work_dir: Path) -> bool:
     """Run ``gh actions-lock`` and add the verify workflow.
 
-    ``gh actions-lock`` writes the lockfile and rewrites inline SHA pins back
-    to version tags. The verify workflow is added when missing and then
-    locked by a second run.
+    ``gh actions-lock`` writes the lockfile, rewrites inline SHA pins back to
+    version tags, and (via ``--migrate-local-actions``) rewrites local
+    ``./foo`` references to repo-relative ``$/foo`` so their dependencies are
+    locked too. The verify workflow is added when missing and then locked by
+    a second run.
 
     Returns True if the working tree has any changes afterwards.
     """
@@ -276,7 +256,7 @@ def migrate_repo(work_dir: Path) -> bool:
     verify_path = work_dir / VERIFY_WORKFLOW_PATH
     if not verify_path.exists():
         verify_path.parent.mkdir(parents=True, exist_ok=True)
-        verify_path.write_text(render_verify_workflow(uses_local_actions(work_dir)))
+        verify_path.write_text(VERIFY_WORKFLOW_TEMPLATE)
         print(f"    Added {VERIFY_WORKFLOW_PATH}")
         run_actions_lock(*BASE_LOCK_ARGS, cwd=work_dir)
 

@@ -27,9 +27,7 @@ from workflow_shas.commands.lock import (
     pr_body,
     process_repo,
     push_branch,
-    render_verify_workflow,
     reset_repo,
-    uses_local_actions,
     verify_lockfile,
 )
 
@@ -72,16 +70,6 @@ def test_verify_template_content() -> None:
     assert "\u2014" not in VERIFY_WORKFLOW_TEMPLATE
 
 
-def test_render_verify_workflow_plain() -> None:
-    assert render_verify_workflow(False) == VERIFY_WORKFLOW_TEMPLATE
-
-
-def test_render_verify_workflow_with_local_actions() -> None:
-    rendered = render_verify_workflow(True)
-    assert rendered.endswith("run: gh actions-lock --verify --ignore-local-actions\n")
-    assert rendered.count("--ignore-local-actions") == 1
-
-
 def test_pr_body_without_issue() -> None:
     body = pr_body()
     assert "Closes #" not in body
@@ -101,33 +89,6 @@ def write_workflow(work_dir: Path, name: str, content: str) -> None:
     path = work_dir / ".github" / "workflows" / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
-
-
-def test_uses_local_actions_no_workflows_dir(tmp_path: Path) -> None:
-    assert uses_local_actions(tmp_path) is False
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        "      - uses: ./",
-        "      - uses: ./.github/actions/foo",
-        "      - uses: './foo'",
-        "    uses: ./.github/workflows/reusable.yml",
-    ],
-)
-def test_uses_local_actions_detects(tmp_path: Path, line: str) -> None:
-    write_workflow(tmp_path, "a.yml", "jobs:\n  x:\n" + line + "\n")
-    assert uses_local_actions(tmp_path) is True
-
-
-def test_uses_local_actions_ignores_remote(tmp_path: Path) -> None:
-    write_workflow(
-        tmp_path,
-        "a.yml",
-        "steps:\n  - uses: actions/checkout@v4\n  - run: echo uses: ./x\n",
-    )
-    assert uses_local_actions(tmp_path) is False
 
 
 # --- git helpers with a real repo -------------------------------------------
@@ -228,21 +189,9 @@ def test_migrate_repo_writes_verify_workflow_when_missing(
     written = (tmp_path / VERIFY_WORKFLOW_PATH).read_text()
     assert written == VERIFY_WORKFLOW_TEMPLATE
     assert written.endswith("\n")
-    expected = (("--no-interactive", "--ignore-local-actions"), {"cwd": tmp_path})
+    expected = (("--no-interactive", "--migrate-local-actions"), {"cwd": tmp_path})
     assert rec.calls == [expected, expected]
     assert f"Added {VERIFY_WORKFLOW_PATH}" in capsys.readouterr().out
-
-
-def test_migrate_repo_local_actions_get_flag(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    write_workflow(tmp_path, "ci.yml", "steps:\n  - uses: ./\n")
-    monkeypatch.setattr(lock, "run_actions_lock", LockRecorder())
-    monkeypatch.setattr(lock, "has_changes", lambda wd: False)
-
-    assert migrate_repo(tmp_path) is False
-    written = (tmp_path / VERIFY_WORKFLOW_PATH).read_text()
-    assert "gh actions-lock --verify --ignore-local-actions" in written
 
 
 def test_migrate_repo_keeps_existing_verify_workflow(
@@ -276,7 +225,7 @@ def test_verify_lockfile_valid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     assert verify_lockfile(tmp_path) is True
     assert rec.calls == [
         (
-            ("--no-fix", "--json", "--no-interactive", "--ignore-local-actions"),
+            ("--no-fix", "--json", "--no-interactive", "--migrate-local-actions"),
             {"cwd": tmp_path, "check": False},
         )
     ]
