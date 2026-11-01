@@ -6,6 +6,8 @@ workflows:
     '.github/workflows/check.yml':
         - 'actions/checkout@v6.0.2'
         - 'actions/create-github-app-token@v3.2.0'
+        - 'actions/setup-python@v6.2.0'
+        - 'astral-sh/setup-uv@v8.1.0'
     '.github/workflows/verify-lockfile.yml':
         - 'actions/checkout@v7.0.1'
 dependencies:
@@ -24,3 +26,13 @@ dependencies:
         commit: 'sha1-bcd2ba49218906704ab6c1aa796996da409d3eb1'
         owner_id: 44036562
         repo_id: 642580244
+    'actions/setup-python@v6.2.0':
+        ref: 'v6.2.0'
+        commit: 'sha1-a309ff8b426b58ec0e2a45f0f869d46889d02405'
+        owner_id: 44036562
+        repo_id: 192625525
+    'astral-sh/setup-uv@v8.1.0':
+        ref: 'v8.1.0'
+        commit: 'sha1-08807647e7069bb48b6ef5acd8ec9567f424441b'
+        owner_id: 115962839
+        repo_id: 846733598

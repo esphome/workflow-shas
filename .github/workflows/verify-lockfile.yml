@@ -23,4 +23,4 @@ jobs:
       - name: Install gh-actions-lock
         run: gh extension install github/gh-actions-lock --pin v0.4.0
       - name: Verify lockfile
-        run: gh actions-lock --verify --ignore-local-actions
+        run: gh actions-lock --verify
