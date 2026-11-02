@@ -27,6 +27,7 @@ from workflow_shas.commands.lock import (
     pr_body,
     process_repo,
     push_branch,
+    render_verify_workflow,
     reset_repo,
     verify_lockfile,
 )
@@ -67,7 +68,16 @@ def test_verify_template_content() -> None:
     assert "actions/checkout@v7.0.1" in VERIFY_WORKFLOW_TEMPLATE
     assert "--pin v0.4.0" in VERIFY_WORKFLOW_TEMPLATE
     assert "${{ github.token }}" in VERIFY_WORKFLOW_TEMPLATE
+    assert "__DEFAULT_BRANCH__" in VERIFY_WORKFLOW_TEMPLATE
     assert "\u2014" not in VERIFY_WORKFLOW_TEMPLATE
+
+
+def test_render_verify_workflow_fills_default_branch() -> None:
+    rendered = render_verify_workflow("dev")
+    assert "__DEFAULT_BRANCH__" not in rendered
+    assert "      - dev\n" in rendered
+    # The GitHub token expression must survive intact.
+    assert "${{ github.token }}" in rendered
 
 
 def test_pr_body_without_issue() -> None:
@@ -184,10 +194,11 @@ def test_migrate_repo_writes_verify_workflow_when_missing(
     monkeypatch.setattr(lock, "run_actions_lock", rec)
     monkeypatch.setattr(lock, "has_changes", lambda wd: True)
 
-    assert migrate_repo(tmp_path) is True
+    assert migrate_repo(tmp_path, "dev") is True
 
     written = (tmp_path / VERIFY_WORKFLOW_PATH).read_text()
-    assert written == VERIFY_WORKFLOW_TEMPLATE
+    assert written == render_verify_workflow("dev")
+    assert "      - dev\n" in written
     assert written.endswith("\n")
     expected = (("--no-interactive", "--migrate-local-actions"), {"cwd": tmp_path})
     assert rec.calls == [expected, expected]
@@ -202,7 +213,7 @@ def test_migrate_repo_keeps_existing_verify_workflow(
     monkeypatch.setattr(lock, "run_actions_lock", rec)
     monkeypatch.setattr(lock, "has_changes", lambda wd: False)
 
-    assert migrate_repo(tmp_path) is False
+    assert migrate_repo(tmp_path, "main") is False
     assert (tmp_path / VERIFY_WORKFLOW_PATH).read_text() == "custom: true\n"
     assert len(rec.calls) == 1
 
@@ -216,7 +227,7 @@ def test_migrate_repo_uses_real_change_detection(
         return cp()
 
     monkeypatch.setattr(lock, "run_actions_lock", fake_lock)
-    assert migrate_repo(git_repo) is True
+    assert migrate_repo(git_repo, "main") is True
 
 
 def test_verify_lockfile_valid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -540,7 +551,8 @@ class ProcessHarness:
         self.cmd = CmdRecorder()
         monkeypatch.setattr(lock, "reset_repo", lambda *a: self.events.append("reset"))
         monkeypatch.setattr(lock, "ensure_repo", self._ensure)
-        monkeypatch.setattr(lock, "migrate_repo", lambda wd: self.changed)
+        monkeypatch.setattr(lock, "get_default_branch", lambda o, r: "main")
+        monkeypatch.setattr(lock, "migrate_repo", lambda wd, db: self.changed)
         monkeypatch.setattr(lock, "verify_lockfile", self._verify)
         monkeypatch.setattr(lock, "run_cmd", self.cmd)
         monkeypatch.setattr(
