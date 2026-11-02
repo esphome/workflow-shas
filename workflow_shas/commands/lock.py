@@ -35,6 +35,11 @@ PR_TITLE = "Adopt gh actions-lock for GitHub Actions pinning"
 
 VERIFY_WORKFLOW_PATH = ".github/workflows/verify-lockfile.yml"
 
+# Placeholder replaced with the repository's default branch by
+# ``render_verify_workflow`` so the push trigger matches repos whose default
+# branch is not ``main`` (e.g. ``dev``).
+DEFAULT_BRANCH_PLACEHOLDER = "__DEFAULT_BRANCH__"
+
 VERIFY_WORKFLOW_TEMPLATE = """\
 name: verify-lockfile
 
@@ -42,7 +47,7 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - __DEFAULT_BRANCH__
 
 permissions:
   contents: read
@@ -240,14 +245,19 @@ def reset_repo(org: str, repo_name: str, workspace: Path) -> None:
             print(f"    Deleted remote branch {BRANCH_NAME}")
 
 
-def migrate_repo(work_dir: Path) -> bool:
+def render_verify_workflow(default_branch: str) -> str:
+    """Render the verify workflow with ``default_branch`` in the push trigger."""
+    return VERIFY_WORKFLOW_TEMPLATE.replace(DEFAULT_BRANCH_PLACEHOLDER, default_branch)
+
+
+def migrate_repo(work_dir: Path, default_branch: str) -> bool:
     """Run ``gh actions-lock`` and add the verify workflow.
 
     ``gh actions-lock`` writes the lockfile, rewrites inline SHA pins back to
     version tags, and (via ``--migrate-local-actions``) rewrites local
     ``./foo`` references to repo-relative ``$/foo`` so their dependencies are
-    locked too. The verify workflow is added when missing and then locked by
-    a second run.
+    locked too. The verify workflow is added when missing (its push trigger
+    uses ``default_branch``) and then locked by a second run.
 
     Returns True if the working tree has any changes afterwards.
     """
@@ -256,7 +266,7 @@ def migrate_repo(work_dir: Path) -> bool:
     verify_path = work_dir / VERIFY_WORKFLOW_PATH
     if not verify_path.exists():
         verify_path.parent.mkdir(parents=True, exist_ok=True)
-        verify_path.write_text(VERIFY_WORKFLOW_TEMPLATE)
+        verify_path.write_text(render_verify_workflow(default_branch))
         print(f"    Added {VERIFY_WORKFLOW_PATH}")
         run_actions_lock(*BASE_LOCK_ARGS, cwd=work_dir)
 
@@ -417,7 +427,7 @@ def process_repo(
             reset_repo(org, repo_name, workspace)
 
         work_dir = ensure_repo(org, repo_name, workspace)
-        changed = migrate_repo(work_dir)
+        changed = migrate_repo(work_dir, get_default_branch(org, repo_name))
 
         if not changed:
             print("    No changes needed")
