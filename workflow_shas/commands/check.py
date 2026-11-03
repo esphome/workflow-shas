@@ -8,6 +8,7 @@ that has not yet adopted ``gh actions-lock``.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from ..gh import gh_api_json, run_gh
@@ -415,6 +416,152 @@ def generate_tracking_body(org: str, results: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Results persistence
+# ---------------------------------------------------------------------------
+
+
+def results_path() -> Path:
+    """Path to the saved ``results.json`` (repo root, next to the package)."""
+    return Path(__file__).resolve().parent.parent.parent / "results.json"
+
+
+def load_previous_results() -> list[dict]:
+    """Load the ``results.json`` from a prior run, or ``[]`` if unavailable."""
+    try:
+        return json.loads(results_path().read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def merge_results(previous: list[dict], scanned: list[dict]) -> list[dict]:
+    """Merge freshly scanned repo results over previously saved ones.
+
+    A scanned entry replaces the previous entry for the same repo; previous
+    entries for repos that were not scanned this run are kept untouched. The
+    result is sorted by repo name. This keeps a ``--repo`` subset run from
+    rewriting the tracking issue body with only the scanned repo(s).
+    """
+    by_name: dict[str, dict] = {r["name"]: r for r in previous}
+    for r in scanned:
+        by_name[r["name"]] = r
+    return sorted(by_name.values(), key=lambda r: r["name"])
+
+
+_REPO_LINK_RE = re.compile(r"\[([^\]]+)\]\(")
+
+
+def _enforced_from_label(label: str) -> bool | None:
+    """Map an Enforced-column label back to ``sha_pinning_required``."""
+    return {"Yes": True, "No": False}.get(label, None)
+
+
+def parse_tracking_body(body: str) -> list[dict]:
+    """Reconstruct per-repo results from an existing tracking issue body.
+
+    The live issue is the only complete, authoritative record of every repo's
+    state, so a ``--repo`` subset run rebuilds its baseline from it (rather
+    than from a possibly stale or subset-only ``results.json``) and then merges
+    the freshly scanned repos over the top. Fields that the body does not carry
+    are filled with safe defaults: repos listed only as bullets (no workflows /
+    no external actions) have no Enforced column, so ``sha_pinning_required`` is
+    assumed enabled (the common case; a full scan corrects any drift).
+    """
+    results: list[dict] = []
+    section: str | None = None
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("### Compliant Repositories"):
+            section = "compliant"
+        elif s.startswith("### Repositories Not Yet Adopted"):
+            section = "not_adopted"
+        elif s.startswith("### Workflows Without External Actions"):
+            section = "no_actions"
+        elif s.startswith("### Repositories Without Workflows"):
+            section = "no_workflows"
+        elif s.startswith("###") or s.startswith("---"):
+            section = None
+        elif section in ("compliant", "not_adopted") and s.startswith("| ["):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            match = _REPO_LINK_RE.match(cells[0])
+            if not match:
+                continue
+            name = match.group(1)
+            if section == "compliant":
+                wf_cell = cells[2]
+                workflow_files = (
+                    [w.strip().strip("`") for w in wf_cell.split(",") if w.strip()]
+                    if wf_cell
+                    else []
+                )
+                results.append(
+                    {
+                        "name": name,
+                        "has_workflows": True,
+                        "has_lockfile": True,
+                        "has_verify_workflow": True,
+                        "uncovered_workflows": [],
+                        "compliant": True,
+                        "sha_pinning_required": _enforced_from_label(cells[1]),
+                        "workflow_files": workflow_files,
+                    }
+                )
+            else:
+                count = int(cells[4]) if cells[4].isdigit() else 0
+                results.append(
+                    {
+                        "name": name,
+                        "has_workflows": True,
+                        "has_lockfile": cells[2] == "Yes",
+                        "has_verify_workflow": cells[3] == "Yes",
+                        "uncovered_workflows": [""] * count,
+                        "compliant": False,
+                        "sha_pinning_required": _enforced_from_label(cells[1]),
+                        "workflow_files": [],
+                    }
+                )
+        elif section in ("no_actions", "no_workflows") and s.startswith("- ["):
+            match = _REPO_LINK_RE.search(s)
+            if not match:
+                continue
+            results.append(
+                {
+                    "name": match.group(1),
+                    "has_workflows": section == "no_actions",
+                    "has_lockfile": False,
+                    "has_verify_workflow": False,
+                    "uncovered_workflows": [],
+                    "compliant": None,
+                    "sha_pinning_required": True,
+                    "workflow_files": [],
+                }
+            )
+    return results
+
+
+def fetch_tracking_results(org: str, tracking_repo: str) -> list[dict]:
+    """Rebuild the full repo baseline by parsing the live tracking issue."""
+    tracking_repo_full = f"{org}/{tracking_repo}"
+    issue = find_tracking_issue(tracking_repo_full)
+    if not issue:
+        return []
+    try:
+        data = json.loads(
+            run_gh(
+                "issue",
+                "view",
+                str(issue["number"]),
+                "--repo",
+                tracking_repo_full,
+                "--json",
+                "body",
+            )
+        )
+    except (RuntimeError, ValueError):
+        return []
+    return parse_tracking_body(data.get("body", ""))
+
+
+# ---------------------------------------------------------------------------
 # Subcommand entry point
 # ---------------------------------------------------------------------------
 
@@ -437,11 +584,11 @@ def run(
         repo_names = sorted(r["name"] for r in all_repos)
         print(f"Found {len(repo_names)} active repositories in {org}\n")
 
-    results = []
+    scanned_results = []
     for i, name in enumerate(repo_names, 1):
         print(f"  [{i}/{len(repo_names)}] Checking {name}...", end=" ", flush=True)
         result = check_repo(org, name)
-        results.append(result)
+        scanned_results.append(result)
 
         enforced = " [enforced]" if result["sha_pinning_required"] else ""
         if not result["has_workflows"]:
@@ -453,20 +600,42 @@ def run(
         else:
             print(f"NOT adopted{enforced}")
 
-    # Save raw results
-    json_path = Path(__file__).resolve().parent.parent.parent / "results.json"
-    json_path.write_text(json.dumps(results, indent=2) + "\n")
+    # When scanning a subset (--repo), merge the scanned repos over a baseline
+    # of every other repo so the tracking issue body reflects only the scanned
+    # repo(s) moving, instead of being rewritten with just those repos. The
+    # live tracking issue is the authoritative full record, so prefer it; fall
+    # back to results.json only when there is no issue (e.g. a dry run with no
+    # tracking repo, or the very first run).
+    if repos:
+        baseline = fetch_tracking_results(org, tracking_repo) if tracking_repo else []
+        if not baseline:
+            baseline = load_previous_results()
+        if not baseline:
+            print(
+                "\nWarning: no existing tracking issue or results.json found; the "
+                "body will reflect only the scanned repo(s)."
+            )
+        all_results = merge_results(baseline, scanned_results)
+    else:
+        all_results = scanned_results
+
+    # Save the full (merged) results
+    json_path = results_path()
+    json_path.write_text(json.dumps(all_results, indent=2) + "\n")
     print(f"\nResults saved to {json_path}")
 
-    noncompliant_repos = [r for r in results if r["compliant"] is False]
-    compliant_repos = {r["name"] for r in results if r["compliant"] is not False}
+    # Sub-issue management acts only on the repos actually scanned this run.
+    noncompliant_repos = [r for r in scanned_results if r["compliant"] is False]
+    compliant_repos = {
+        r["name"] for r in scanned_results if r["compliant"] is not False
+    }
 
     print(f"\n{len(noncompliant_repos)} non-compliant repos found")
 
     if dry_run:
         print("\n[dry-run] Would create/update tracking issue with body:")
         print("---")
-        print(generate_tracking_body(org, results))
+        print(generate_tracking_body(org, all_results))
         print("---")
         for r in noncompliant_repos:
             print(f"[dry-run] Would create/update sub-issue in {org}/{r['name']}")
@@ -475,7 +644,7 @@ def run(
     # --- Phase 2: Manage tracking issue ---
     tracking_repo_full = f"{org}/{tracking_repo}"
     print("\nManaging tracking issue...")
-    tracking_body = generate_tracking_body(org, results)
+    tracking_body = generate_tracking_body(org, all_results)
 
     tracking_issue = find_tracking_issue(tracking_repo_full)
     if tracking_issue:
