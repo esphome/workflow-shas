@@ -597,3 +597,194 @@ def test_run_full_flow_creates_tracking_issue(
 
     assert router.called_with("issue", "create", "--repo", "org/t")
     assert router.called_with("issue", "pin", "8")
+
+
+# --- results persistence / merge ------------------------------------------
+
+
+def test_load_previous_results_missing(results_dir: Path) -> None:
+    assert check.load_previous_results() == []
+
+
+def test_load_previous_results_invalid(results_dir: Path) -> None:
+    (results_dir / "results.json").write_text("not valid json{")
+    assert check.load_previous_results() == []
+
+
+def test_load_previous_results_present(results_dir: Path) -> None:
+    data = [make_result("a"), make_result("b")]
+    (results_dir / "results.json").write_text(json.dumps(data))
+    assert check.load_previous_results() == data
+
+
+def test_merge_results_replaces_and_keeps_sorted() -> None:
+    previous = [make_result("alpha"), make_result("beta", compliant=False)]
+    scanned = [make_result("beta", compliant=True), make_result("gamma")]
+    merged = check.merge_results(previous, scanned)
+    assert [r["name"] for r in merged] == ["alpha", "beta", "gamma"]
+    beta = next(r for r in merged if r["name"] == "beta")
+    assert beta["compliant"] is True
+
+
+def test_run_subset_merges_into_previous_results(
+    monkeypatch: pytest.MonkeyPatch,
+    results_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A prior full run recorded two repos.
+    previous = [
+        make_result("alpha"),
+        make_result("beta", compliant=False, has_lockfile=False),
+    ]
+    (results_dir / "results.json").write_text(json.dumps(previous))
+
+    # Re-scan only beta, which is now compliant.
+    monkeypatch.setattr(check, "check_repo", lambda org, name: make_result("beta"))
+    check.run("org", "", repos=["beta"], dry_run=True)
+    out = capsys.readouterr().out
+
+    # Saved results keep alpha and update beta - not a one-repo wipe.
+    saved = json.loads((results_dir / "results.json").read_text())
+    assert [r["name"] for r in saved] == ["alpha", "beta"]
+    assert next(r for r in saved if r["name"] == "beta")["compliant"] is True
+
+    # The rendered body reflects both repos.
+    assert "- **2** adopted" in out
+    assert "[alpha]" in out and "[beta]" in out
+    assert "no previous results.json" not in out
+
+
+def test_run_subset_without_previous_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    results_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(check, "check_repo", lambda org, name: make_result(name))
+    check.run("org", "", repos=["solo"], dry_run=True)
+    assert "no existing tracking issue or results.json found" in capsys.readouterr().out
+
+
+# --- tracking-issue parsing / live baseline --------------------------------
+
+
+def test_parse_tracking_body_round_trips() -> None:
+    results = [
+        make_result("alpha", workflow_files=["ci.yml", "release.yml"]),
+        make_result("qmark", sha_pinning_required=None),
+        make_result(
+            "bad",
+            compliant=False,
+            has_lockfile=False,
+            has_verify_workflow=False,
+            uncovered_workflows=[".github/workflows/ci.yml"],
+            sha_pinning_required=False,
+        ),
+        make_result("noext", compliant=None, has_workflows=True),
+        make_result("nowf", has_workflows=False, compliant=None, workflow_files=[]),
+    ]
+    body = check.generate_tracking_body("org", results)
+    parsed = {r["name"]: r for r in check.parse_tracking_body(body)}
+
+    assert set(parsed) == {"alpha", "qmark", "bad", "noext", "nowf"}
+    assert parsed["alpha"]["compliant"] is True
+    assert sorted(parsed["alpha"]["workflow_files"]) == ["ci.yml", "release.yml"]
+    assert parsed["alpha"]["sha_pinning_required"] is True
+    assert parsed["qmark"]["sha_pinning_required"] is None
+    assert parsed["bad"]["compliant"] is False
+    assert parsed["bad"]["has_lockfile"] is False
+    assert parsed["bad"]["has_verify_workflow"] is False
+    assert len(parsed["bad"]["uncovered_workflows"]) == 1
+    assert parsed["bad"]["sha_pinning_required"] is False
+    assert parsed["noext"]["compliant"] is None
+    assert parsed["noext"]["has_workflows"] is True
+    assert parsed["nowf"]["has_workflows"] is False
+    assert parsed["nowf"]["sha_pinning_required"] is True
+
+
+def test_parse_tracking_body_skips_malformed_rows() -> None:
+    body = "\n".join(
+        [
+            "### Compliant Repositories (Lockfile Adopted)",
+            "| [oops |",
+            "### Repositories Without Workflows",
+            "- [oops",
+        ]
+    )
+    assert check.parse_tracking_body(body) == []
+
+
+def test_fetch_tracking_results_no_issue(
+    monkeypatch: pytest.MonkeyPatch, router: GhRouter
+) -> None:
+    router.add("issue", "list", result="[]")
+    monkeypatch.setattr(check, "run_gh", router)
+    assert check.fetch_tracking_results("org", "t") == []
+
+
+def test_fetch_tracking_results_parses_issue(
+    monkeypatch: pytest.MonkeyPatch, router: GhRouter
+) -> None:
+    body = check.generate_tracking_body(
+        "org", [make_result("alpha"), make_result("bad", compliant=False)]
+    )
+    router.add(
+        "issue",
+        "list",
+        result=json.dumps([{"number": 5, "title": TRACKING_ISSUE_TITLE}]),
+    )
+    router.add("issue", "view", result=json.dumps({"body": body}))
+    monkeypatch.setattr(check, "run_gh", router)
+    parsed = check.fetch_tracking_results("org", "t")
+    assert {r["name"] for r in parsed} == {"alpha", "bad"}
+
+
+def test_fetch_tracking_results_view_error(
+    monkeypatch: pytest.MonkeyPatch, router: GhRouter
+) -> None:
+    router.add(
+        "issue",
+        "list",
+        result=json.dumps([{"number": 5, "title": TRACKING_ISSUE_TITLE}]),
+    )
+    router.add("issue", "view", result=RuntimeError("boom"))
+    monkeypatch.setattr(check, "run_gh", router)
+    assert check.fetch_tracking_results("org", "t") == []
+
+
+def test_run_subset_uses_live_issue_as_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    router: GhRouter,
+    results_dir: Path,
+) -> None:
+    # The live issue is the authoritative record: keeper is adopted, esphome is
+    # not. results.json is poisoned with only esphome - it must be ignored.
+    live_body = check.generate_tracking_body(
+        "org",
+        [
+            make_result("keeper"),
+            make_result("esphome", compliant=False, has_lockfile=False),
+        ],
+    )
+    (results_dir / "results.json").write_text(
+        json.dumps([make_result("esphome", compliant=False)])
+    )
+
+    router.add(
+        "issue",
+        "list",
+        result=json.dumps([{"number": 9, "title": TRACKING_ISSUE_TITLE}]),
+    )
+    router.add("issue", "view", result=json.dumps({"body": live_body}))
+    router.add("issue", "edit", "9")
+    router.add("api", "repos/org/t/issues/9/sub_issues", "--paginate", result="[]")
+    monkeypatch.setattr(check, "check_repo", lambda org, name: make_result("esphome"))
+    monkeypatch.setattr(check, "run_gh", router)
+
+    check.run("org", "t", repos=["esphome"])
+
+    edit = router.called_with("issue", "edit", "9")[0]
+    body = edit[edit.index("--body") + 1]
+    # keeper is preserved and esphome moved to adopted - no one-repo wipe.
+    assert "- **2** adopted" in body
+    assert "[keeper]" in body
+    assert "### Repositories Not Yet Adopted" not in body
